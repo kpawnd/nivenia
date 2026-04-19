@@ -73,16 +73,11 @@ func (e Engine) RunBootRestore() error {
 
 	if err := restore.RestoreFromBaseline(e.Policy.BaselineRoot, e.Policy.ManagedRoot, e.Policy.ExcludePaths); err != nil {
 		s.FailureCount++
-		if s.FailureCount >= maxConsecutiveRestoreFailures {
-			s.Mode = state.ModeThawed
-			s.LastRestoreOK = false
-			s.LastMessage = fmt.Sprintf("restore failed %d times; auto-thawed to prevent boot loop: %v", s.FailureCount, err)
-			_ = state.Save(e.Policy.StateFile, s)
-			appendLog(e.Policy.LogFile, s.LastMessage)
-			return nil
-		}
 		s.LastRestoreOK = false
 		s.LastMessage = fmt.Sprintf("restore failed (%d/%d): %v", s.FailureCount, maxConsecutiveRestoreFailures, err)
+		if s.FailureCount >= maxConsecutiveRestoreFailures {
+			s.LastMessage = fmt.Sprintf("restore failed %d times; frozen mode preserved (no auto-thaw): %v", s.FailureCount, err)
+		}
 		_ = state.Save(e.Policy.StateFile, s)
 		appendLog(e.Policy.LogFile, s.LastMessage)
 		return err

@@ -72,10 +72,9 @@ Restore behavior:
 
 - boot restore waits for system readiness before running
 - restore daemon runs once at boot (not continuously during uptime)
-- restore runs in two phases by default:
-	- phase 1: non-destructive sync (safe default)
-	- phase 2: optional delete pass when `NIVENIA_ENABLE_DELETE_PASS=1`
-- if restore fails 3 consecutive boots, Nivenia auto-thaws to prevent boot loops
+- strict default restore uses delete pass so newly-created files are removed on reboot
+- optional safe mode: set `NIVENIA_SAFE_SYNC_ONLY=1` to disable delete pass
+- restore failures are tracked, but mode is not auto-changed to thawed
 
 ## Release pipeline
 

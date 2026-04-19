@@ -184,17 +184,11 @@ func RestoreFromBaseline(baselineRoot, managedRoot string, excludes []string) er
 		return fmt.Errorf("baseline path %s is not a directory", src)
 	}
 
-	// Phase 1: fast non-destructive restore to reduce boot-time risk.
-	if err := runRsync(src+"/", dst+"/", excludes, false); err != nil {
-		return err
+	// Strict default: restore with delete pass so new files are removed on reboot.
+	deletePass := true
+	if strings.EqualFold(os.Getenv("NIVENIA_SAFE_SYNC_ONLY"), "1") {
+		deletePass = false
 	}
 
-	// Phase 2 (optional): destructive delete pass for strict parity.
-	if strings.EqualFold(os.Getenv("NIVENIA_ENABLE_DELETE_PASS"), "1") {
-		if err := runRsync(src+"/", dst+"/", excludes, true); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return runRsync(src+"/", dst+"/", excludes, deletePass)
 }
