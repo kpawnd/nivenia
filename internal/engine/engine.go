@@ -11,6 +11,8 @@ import (
 	"nivenia/internal/state"
 )
 
+const maxConsecutiveRestoreFailures = 3
+
 type Engine struct {
 	Policy config.Policy
 }
@@ -35,6 +37,19 @@ func (e Engine) RunBootRestore() error {
 		return err
 	}
 
+	lockPath := "/var/lib/nivenia/restore.lock"
+	_ = os.MkdirAll(filepath.Dir(lockPath), 0o755)
+	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		s.LastRestoreOK = false
+		s.LastMessage = "restore skipped: another restore process is active"
+		_ = state.Save(e.Policy.StateFile, s)
+		appendLog(e.Policy.LogFile, s.LastMessage)
+		return nil
+	}
+	_ = lockFile.Close()
+	defer os.Remove(lockPath)
+
 	marker := "/var/lib/nivenia/restore.started"
 	_ = os.MkdirAll(filepath.Dir(marker), 0o755)
 
@@ -57,13 +72,23 @@ func (e Engine) RunBootRestore() error {
 	_ = os.WriteFile(marker, []byte(time.Now().UTC().Format(time.RFC3339)), 0o644)
 
 	if err := restore.RestoreFromBaseline(e.Policy.BaselineRoot, e.Policy.ManagedRoot, e.Policy.ExcludePaths); err != nil {
+		s.FailureCount++
+		if s.FailureCount >= maxConsecutiveRestoreFailures {
+			s.Mode = state.ModeThawed
+			s.LastRestoreOK = false
+			s.LastMessage = fmt.Sprintf("restore failed %d times; auto-thawed to prevent boot loop: %v", s.FailureCount, err)
+			_ = state.Save(e.Policy.StateFile, s)
+			appendLog(e.Policy.LogFile, s.LastMessage)
+			return nil
+		}
 		s.LastRestoreOK = false
-		s.LastMessage = fmt.Sprintf("restore failed: %v", err)
+		s.LastMessage = fmt.Sprintf("restore failed (%d/%d): %v", s.FailureCount, maxConsecutiveRestoreFailures, err)
 		_ = state.Save(e.Policy.StateFile, s)
 		appendLog(e.Policy.LogFile, s.LastMessage)
 		return err
 	}
 
+	s.FailureCount = 0
 	s.LastRestoreOK = true
 	s.LastMessage = "restore completed"
 	if err := state.Save(e.Policy.StateFile, s); err != nil {

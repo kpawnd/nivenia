@@ -12,9 +12,13 @@
     "/private/var/lib/nivenia",
     "/private/var/db/diagnostics",
     "/private/var/db/DetachedSignatures",
+    "/private/var/db/AuthenticationAuthority",
+    "/private/var/db/KerberosKDC",
     "/private/var/protected",
     "/private/etc/fstab",
     "/Library/Caches",
+    "/Library/Frameworks",
+    "/Library/SystemExtensions",
     "/Library/Logs",
     "/Volumes",
     "/dev"

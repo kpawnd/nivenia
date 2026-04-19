@@ -71,17 +71,20 @@ Key fields:
 Restore behavior:
 
 - boot restore waits for system readiness before running
+- restore daemon runs once at boot (not continuously during uptime)
 - restore runs in two phases by default:
 	- phase 1: non-destructive sync (safe default)
 	- phase 2: optional delete pass when `NIVENIA_ENABLE_DELETE_PASS=1`
+- if restore fails 3 consecutive boots, Nivenia auto-thaws to prevent boot loops
 
 ## Release pipeline
 
 Workflow: `.github/workflows/release.yml`
 
 - builds Intel macOS binaries
-- packages `niveniad`, `niveniactl`, `policy.json`, `setup.sh`, `update.sh`, and launchd plists into a release tarball
-- publishes on `v*` tags
+- packages `niveniad`, `niveniactl`, `policy.json`, `setup.sh`, `update.sh`, `emergency_recovery_disable.sh`, and launchd plists into a release tarball
+- publishes on `main` pushes and `v*` tags
+- emits normal GitHub Releases so `nivenia-update` can discover them via `/releases/latest`
 
 ## Notes
 
@@ -89,6 +92,7 @@ Workflow: `.github/workflows/release.yml`
 - baseline capture and restore use `rsync`
 - state is stored at `/var/lib/nivenia/state.json`
 - emergency script is installed at `/var/lib/nivenia/recovery/nivenia-emergency-disable.sh` for Recovery mode use
+- restore uses a lock file to prevent concurrent runs (`/var/lib/nivenia/restore.lock`)
 
 ## Recovery emergency disable
 

@@ -20,6 +20,7 @@ type State struct {
 	Mode          Mode   `json:"mode"`
 	LastRestoreOK bool   `json:"last_restore_ok"`
 	LastMessage   string `json:"last_message"`
+	FailureCount  int    `json:"failure_count,omitempty"`
 	UpdatedAtUTC  string `json:"updated_at_utc"`
 }
 
