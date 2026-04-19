@@ -110,9 +110,10 @@ func runRsync(src, dst string, excludes []string, delete bool) error {
 	fmt.Fprintf(os.Stderr, "\r\033[2K")
 
 	if err := cmd.Wait(); err != nil {
-		errMsg := fmt.Sprintf("rsync failed: %w", err)
+		// Build detailed error message with rsync arguments for debugging
+		errMsg := fmt.Sprintf("rsync failed: %v\ncommand: rsync %s", err, strings.Join(args, " "))
 		if len(errorLines) > 0 {
-			errMsg += "\nrsync errors:\n" + strings.Join(errorLines, "\n")
+			errMsg += "\nrsync output:\n" + strings.Join(errorLines, "\n")
 		}
 		return fmt.Errorf(errMsg)
 	}
