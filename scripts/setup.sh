@@ -89,10 +89,34 @@ echo "capturing baseline and enabling frozen mode..."
 sudo /usr/local/bin/niveniactl freeze --policy "$POLICY_PATH" --state "$STATE_PATH"
 
 echo "starting launch daemon..."
+sudo rm -f /var/lib/nivenia/restore.lock
 sudo launchctl bootout system "$DAEMON_PATH" >/dev/null 2>&1 || true
 sudo launchctl bootstrap system "$DAEMON_PATH"
 sudo launchctl bootout system "$UPDATER_DAEMON_PATH" >/dev/null 2>&1 || true
 sudo launchctl bootstrap system "$UPDATER_DAEMON_PATH"
+
+echo "verifying restore daemon..."
+sudo launchctl kickstart -k system/com.nivenia.restore >/dev/null 2>&1 || {
+  echo "failed to kickstart com.nivenia.restore" >&2
+  exit 1
+}
+
+verify_ok=0
+for _ in $(seq 1 30); do
+  status_line="$(sudo /usr/local/bin/niveniactl status --state "$STATE_PATH" 2>/dev/null || true)"
+  if [[ "$status_line" == *'mode=frozen'* && "$status_line" == *'last_restore_ok=true'* && "$status_line" == *'message="restore completed"'* ]]; then
+    verify_ok=1
+    break
+  fi
+  sleep 1
+done
+
+if [[ "$verify_ok" != "1" ]]; then
+  echo "restore verification failed; check logs:" >&2
+  echo "  sudo tail -n 120 /var/log/nivenia.log" >&2
+  echo "  sudo tail -n 120 /var/log/niveniad.err.log" >&2
+  exit 1
+fi
 
 echo "done"
 echo "status:"

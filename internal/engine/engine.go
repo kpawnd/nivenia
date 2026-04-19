@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,10 @@ import (
 )
 
 const maxConsecutiveRestoreFailures = 3
+
+var errRestoreAlreadyRunning = errors.New("restore already running")
+
+const restoreLockStaleAfter = 30 * time.Minute
 
 type Engine struct {
 	Policy config.Policy
@@ -31,6 +36,46 @@ func appendLog(path, msg string) {
 	_, _ = f.WriteString(time.Now().UTC().Format(time.RFC3339) + " " + msg + "\n")
 }
 
+func writeLockMetadata(path string) error {
+	meta := time.Now().UTC().Format(time.RFC3339) + "\n"
+	return os.WriteFile(path, []byte(meta), 0o644)
+}
+
+func lockLooksActive(path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	return time.Since(fi.ModTime()) < restoreLockStaleAfter
+}
+
+func acquireRestoreLock(path string) error {
+	for attempts := 0; attempts < 2; attempts++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			_ = f.Close()
+			if err := writeLockMetadata(path); err != nil {
+				_ = os.Remove(path)
+				return err
+			}
+			return nil
+		}
+		if !os.IsExist(err) {
+			return err
+		}
+
+		if lockLooksActive(path) {
+			return errRestoreAlreadyRunning
+		}
+
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return errRestoreAlreadyRunning
+		}
+	}
+
+	return errRestoreAlreadyRunning
+}
+
 func (e Engine) RunBootRestore() error {
 	s, err := state.Load(e.Policy.StateFile)
 	if err != nil {
@@ -39,15 +84,17 @@ func (e Engine) RunBootRestore() error {
 
 	lockPath := "/var/lib/nivenia/restore.lock"
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o755)
-	lockFile, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	err = acquireRestoreLock(lockPath)
 	if err != nil {
+		if !errors.Is(err, errRestoreAlreadyRunning) {
+			return err
+		}
 		s.LastRestoreOK = false
 		s.LastMessage = "restore skipped: another restore process is active"
 		_ = state.Save(e.Policy.StateFile, s)
 		appendLog(e.Policy.LogFile, s.LastMessage)
 		return nil
 	}
-	_ = lockFile.Close()
 	defer os.Remove(lockPath)
 
 	marker := "/var/lib/nivenia/restore.started"
