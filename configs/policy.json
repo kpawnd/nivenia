@@ -1,0 +1,15 @@
+{
+  "managed_root": "/System/Volumes/Data",
+  "baseline_root": "/var/lib/nivenia/baseline",
+  "exclude_paths": [
+    "/private/tmp",
+    "/private/var/tmp",
+    "/private/var/run",
+    "/private/var/db/nivenia",
+    "/private/var/lib/nivenia",
+    "/Volumes",
+    "/dev"
+  ],
+  "state_file": "/var/lib/nivenia/state.json",
+  "log_file": "/var/log/nivenia.log"
+}

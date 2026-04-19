@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+POLICY_PATH="${NIVENIA_POLICY_PATH:-/etc/nivenia/policy.json}"
+STATE_PATH="${NIVENIA_STATE_PATH:-/var/lib/nivenia/state.json}"
+DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.restore.plist"
+UPDATER_DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.updater.plist"
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+need_cmd go
+need_cmd sudo
+need_cmd launchctl
+need_cmd rsync
+need_cmd sw_vers
+
+OS_VERSION="$(sw_vers -productVersion)"
+OS_MAJOR="${OS_VERSION%%.*}"
+if ! [[ "$OS_MAJOR" =~ ^[0-9]+$ ]]; then
+  echo "could not parse macOS version: $OS_VERSION" >&2
+  exit 1
+fi
+if (( OS_MAJOR < 12 || OS_MAJOR > 15 )); then
+  echo "unsupported macOS $OS_VERSION: only Monterey (12) through Sequoia (15) are supported" >&2
+  exit 1
+fi
+
+cd "$REPO_ROOT"
+
+echo "building niveniad and niveniactl..."
+go build -o niveniad ./cmd/niveniad
+go build -o niveniactl ./cmd/niveniactl
+
+echo "installing binaries, updater, and policy..."
+sudo install -d /usr/local/libexec /usr/local/bin /etc/nivenia /var/lib/nivenia
+sudo install -m 755 niveniad /usr/local/libexec/niveniad
+sudo install -m 755 niveniactl /usr/local/bin/niveniactl
+sudo install -m 755 scripts/update.sh /usr/local/libexec/nivenia-updater
+sudo install -m 755 scripts/update.sh /usr/local/bin/nivenia-update
+sudo install -m 644 configs/policy.json "$POLICY_PATH"
+sudo install -m 644 launchd/com.nivenia.restore.plist "$DAEMON_PATH"
+sudo install -m 644 launchd/com.nivenia.updater.plist "$UPDATER_DAEMON_PATH"
+
+echo "capturing baseline and enabling frozen mode..."
+sudo /usr/local/bin/niveniactl freeze --policy "$POLICY_PATH" --state "$STATE_PATH"
+
+echo "starting launch daemon..."
+sudo launchctl bootout system "$DAEMON_PATH" >/dev/null 2>&1 || true
+sudo launchctl bootstrap system "$DAEMON_PATH"
+sudo launchctl bootout system "$UPDATER_DAEMON_PATH" >/dev/null 2>&1 || true
+sudo launchctl bootstrap system "$UPDATER_DAEMON_PATH"
+
+echo "done"
+echo "status:"
+sudo /usr/local/bin/niveniactl status --state "$STATE_PATH"
+echo "thaw temporarily: sudo niveniactl thaw-once"
+echo "thaw until refreeze: sudo niveniactl thaw"
+echo "refreeze now: sudo niveniactl freeze --policy $POLICY_PATH --state $STATE_PATH"
+echo "manual update: sudo nivenia-update"
