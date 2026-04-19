@@ -64,8 +64,8 @@ func runRsync(src, dst string, excludes []string, delete bool) error {
 	}
 	// Optimizations for initial capture:
 	// --whole-file: disable delta algorithm (faster for local copies)
-	// --info=progress2: show aggregate progress with speed
-	args = append(args, "--whole-file", "--info=progress2")
+	// --progress: show progress (compatible with older rsync versions like macOS 2.6.9)
+	args = append(args, "--whole-file", "--progress")
 	args = append(args, rsyncExcludeArgs(excludes)...)
 	args = append(args, src, dst)
 
