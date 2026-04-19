@@ -19,6 +19,7 @@ What setup does:
 - builds `niveniad` and `niveniactl`
 - installs binaries to `/usr/local/libexec` and `/usr/local/bin`
 - installs updater command as `nivenia-update`
+- installs emergency command as `nivenia-emergency-disable`
 - installs policy to `/etc/nivenia/policy.json`
 - captures initial baseline
 - enables restore and updater launch daemons at boot
@@ -33,6 +34,7 @@ sudo niveniactl thaw
 sudo niveniactl thaw-once
 sudo niveniactl freeze --policy /etc/nivenia/policy.json --state /var/lib/nivenia/state.json
 sudo nivenia-update
+sudo nivenia-emergency-disable
 ```
 
 Mode behavior:
@@ -66,6 +68,13 @@ Key fields:
 - `baseline_root`: snapshot storage location
 - `exclude_paths`: always excluded from baseline/restore
 
+Restore behavior:
+
+- boot restore waits for system readiness before running
+- restore runs in two phases by default:
+	- phase 1: non-destructive sync (safe default)
+	- phase 2: optional delete pass when `NIVENIA_ENABLE_DELETE_PASS=1`
+
 ## Release pipeline
 
 Workflow: `.github/workflows/release.yml`
@@ -79,6 +88,26 @@ Workflow: `.github/workflows/release.yml`
 - first `freeze` captures baseline and can take time
 - baseline capture and restore use `rsync`
 - state is stored at `/var/lib/nivenia/state.json`
+- emergency script is installed at `/var/lib/nivenia/recovery/nivenia-emergency-disable.sh` for Recovery mode use
+
+## Recovery emergency disable
+
+If a system gets stuck during startup:
+
+1. Boot into macOS Recovery and open Terminal.
+2. Mount Data volume (example name below):
+
+```sh
+diskutil mount "Macintosh HD - Data"
+```
+
+3. Run the emergency script from the mounted volume:
+
+```sh
+bash "/Volumes/Macintosh HD - Data/var/lib/nivenia/recovery/nivenia-emergency-disable.sh" "/Volumes/Macintosh HD - Data"
+```
+
+This forces thawed mode and disables Nivenia launch daemons.
 
 ## License
 

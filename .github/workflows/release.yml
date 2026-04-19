@@ -49,6 +49,7 @@ jobs:
           cp launchd/com.nivenia.updater.plist "$OUT_DIR/com.nivenia.updater.plist"
           cp scripts/setup.sh "$OUT_DIR/setup.sh"
           cp scripts/update.sh "$OUT_DIR/update.sh"
+          cp scripts/emergency_recovery_disable.sh "$OUT_DIR/emergency_recovery_disable.sh"
 
       - name: Create archive
         shell: bash

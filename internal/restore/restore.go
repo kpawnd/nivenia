@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -57,6 +58,27 @@ func formatSpeed(bytes int64) string {
 	}
 }
 
+var (
+	rsyncHelpOnce sync.Once
+	rsyncHelpText string
+)
+
+func rsyncSupportsFlag(flag string) bool {
+	rsyncHelpOnce.Do(func() {
+		cmd := exec.Command("rsync", "--help")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			rsyncHelpText = ""
+			return
+		}
+		rsyncHelpText = string(out)
+	})
+	if rsyncHelpText == "" {
+		return false
+	}
+	return strings.Contains(rsyncHelpText, flag)
+}
+
 func runRsync(src, dst string, excludes []string, delete bool) error {
 	args := []string{"-aH", "--numeric-ids"}
 	if delete {
@@ -64,8 +86,23 @@ func runRsync(src, dst string, excludes []string, delete bool) error {
 	}
 	// Optimizations for initial capture:
 	// --whole-file: disable delta algorithm (faster for local copies)
-	// --progress: show progress (compatible with older rsync versions like macOS 2.6.9)
-	args = append(args, "--whole-file", "--progress")
+	args = append(args, "--whole-file")
+
+	if rsyncSupportsFlag("--info=progress2") {
+		args = append(args, "--info=progress2")
+	} else {
+		// Compatible with older Apple rsync/openrsync builds.
+		args = append(args, "--progress")
+	}
+
+	// Avoid metadata failures on protected paths during restore/capture.
+	if rsyncSupportsFlag("--no-xattrs") {
+		args = append(args, "--no-xattrs")
+	}
+	if rsyncSupportsFlag("--no-acls") {
+		args = append(args, "--no-acls")
+	}
+
 	args = append(args, rsyncExcludeArgs(excludes)...)
 	args = append(args, src, dst)
 
@@ -147,5 +184,17 @@ func RestoreFromBaseline(baselineRoot, managedRoot string, excludes []string) er
 		return fmt.Errorf("baseline path %s is not a directory", src)
 	}
 
-	return runRsync(src+"/", dst+"/", excludes, true)
+	// Phase 1: fast non-destructive restore to reduce boot-time risk.
+	if err := runRsync(src+"/", dst+"/", excludes, false); err != nil {
+		return err
+	}
+
+	// Phase 2 (optional): destructive delete pass for strict parity.
+	if strings.EqualFold(os.Getenv("NIVENIA_ENABLE_DELETE_PASS"), "1") {
+		if err := runRsync(src+"/", dst+"/", excludes, true); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }

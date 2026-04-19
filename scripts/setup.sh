@@ -33,16 +33,28 @@ fi
 
 cd "$REPO_ROOT"
 
+UPDATE_SCRIPT_SOURCE="scripts/update.sh"
+if [[ ! -f "$UPDATE_SCRIPT_SOURCE" ]]; then
+  UPDATE_SCRIPT_SOURCE="update.sh"
+fi
+
+EMERGENCY_SCRIPT_SOURCE="scripts/emergency_recovery_disable.sh"
+if [[ ! -f "$EMERGENCY_SCRIPT_SOURCE" ]]; then
+  EMERGENCY_SCRIPT_SOURCE="emergency_recovery_disable.sh"
+fi
+
 echo "building niveniad and niveniactl..."
 go build -o niveniad ./cmd/niveniad
 go build -o niveniactl ./cmd/niveniactl
 
 echo "installing binaries, updater, and policy..."
-sudo install -d /usr/local/libexec /usr/local/bin /etc/nivenia /var/lib/nivenia
+sudo install -d /usr/local/libexec /usr/local/bin /etc/nivenia /var/lib/nivenia /var/lib/nivenia/recovery
 sudo install -m 755 niveniad /usr/local/libexec/niveniad
 sudo install -m 755 niveniactl /usr/local/bin/niveniactl
-sudo install -m 755 scripts/update.sh /usr/local/libexec/nivenia-updater
-sudo install -m 755 scripts/update.sh /usr/local/bin/nivenia-update
+sudo install -m 755 "$UPDATE_SCRIPT_SOURCE" /usr/local/libexec/nivenia-updater
+sudo install -m 755 "$UPDATE_SCRIPT_SOURCE" /usr/local/bin/nivenia-update
+sudo install -m 755 "$EMERGENCY_SCRIPT_SOURCE" /usr/local/bin/nivenia-emergency-disable
+sudo install -m 755 "$EMERGENCY_SCRIPT_SOURCE" /var/lib/nivenia/recovery/nivenia-emergency-disable.sh
 sudo install -m 644 configs/policy.json "$POLICY_PATH"
 sudo install -m 644 launchd/com.nivenia.restore.plist "$DAEMON_PATH"
 sudo install -m 644 launchd/com.nivenia.updater.plist "$UPDATER_DAEMON_PATH"
@@ -63,3 +75,5 @@ echo "thaw temporarily: sudo niveniactl thaw-once"
 echo "thaw until refreeze: sudo niveniactl thaw"
 echo "refreeze now: sudo niveniactl freeze --policy $POLICY_PATH --state $STATE_PATH"
 echo "manual update: sudo nivenia-update"
+echo "emergency disable: sudo nivenia-emergency-disable"
+echo "recovery script: /var/lib/nivenia/recovery/nivenia-emergency-disable.sh"
