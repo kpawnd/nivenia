@@ -2,3 +2,6 @@ bin/
 *.log
 *.out
 *.err
+niveniad
+niveniactl
+dist/
