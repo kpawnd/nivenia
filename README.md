@@ -20,7 +20,9 @@ What setup does:
 - installs binaries to `/usr/local/libexec` and `/usr/local/bin`
 - installs updater command as `nivenia-update`
 - installs emergency command as `nivenia-emergency-disable`
+- installs pre-capture cleanup command as `nivenia-prepare-clean-capture`
 - installs policy to `/etc/nivenia/policy.json`
+- clears browser/session/cache data before first baseline capture (can be skipped)
 - captures initial baseline
 - enables restore and updater launch daemons at boot
 
@@ -35,6 +37,13 @@ sudo niveniactl thaw-once
 sudo niveniactl freeze --policy /etc/nivenia/policy.json --state /var/lib/nivenia/state.json
 sudo nivenia-update
 sudo nivenia-emergency-disable
+sudo nivenia-prepare-clean-capture
+```
+
+To skip automatic pre-capture cleanup during setup:
+
+```sh
+NIVENIA_SKIP_PRECAPTURE_CLEAN=1 bash scripts/setup.sh
 ```
 
 Mode behavior:

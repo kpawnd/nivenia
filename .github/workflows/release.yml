@@ -58,6 +58,7 @@ jobs:
           cp scripts/setup.sh "$OUT_DIR/setup.sh"
           cp scripts/update.sh "$OUT_DIR/update.sh"
           cp scripts/emergency_recovery_disable.sh "$OUT_DIR/emergency_recovery_disable.sh"
+          cp scripts/prepare_clean_capture.sh "$OUT_DIR/prepare_clean_capture.sh"
 
       - name: Create archive
         shell: bash

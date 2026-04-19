@@ -43,6 +43,11 @@ if [[ ! -f "$EMERGENCY_SCRIPT_SOURCE" ]]; then
   EMERGENCY_SCRIPT_SOURCE="emergency_recovery_disable.sh"
 fi
 
+PREPARE_CLEAN_CAPTURE_SOURCE="scripts/prepare_clean_capture.sh"
+if [[ ! -f "$PREPARE_CLEAN_CAPTURE_SOURCE" ]]; then
+  PREPARE_CLEAN_CAPTURE_SOURCE="prepare_clean_capture.sh"
+fi
+
 echo "building niveniad and niveniactl..."
 go build -o niveniad ./cmd/niveniad
 go build -o niveniactl ./cmd/niveniactl
@@ -55,9 +60,18 @@ sudo install -m 755 "$UPDATE_SCRIPT_SOURCE" /usr/local/libexec/nivenia-updater
 sudo install -m 755 "$UPDATE_SCRIPT_SOURCE" /usr/local/bin/nivenia-update
 sudo install -m 755 "$EMERGENCY_SCRIPT_SOURCE" /usr/local/bin/nivenia-emergency-disable
 sudo install -m 755 "$EMERGENCY_SCRIPT_SOURCE" /var/lib/nivenia/recovery/nivenia-emergency-disable.sh
+sudo install -m 755 "$PREPARE_CLEAN_CAPTURE_SOURCE" /usr/local/libexec/nivenia-prepare-clean-capture
+sudo install -m 755 "$PREPARE_CLEAN_CAPTURE_SOURCE" /usr/local/bin/nivenia-prepare-clean-capture
 sudo install -m 644 configs/policy.json "$POLICY_PATH"
 sudo install -m 644 launchd/com.nivenia.restore.plist "$DAEMON_PATH"
 sudo install -m 644 launchd/com.nivenia.updater.plist "$UPDATER_DAEMON_PATH"
+
+if [[ "${NIVENIA_SKIP_PRECAPTURE_CLEAN:-0}" != "1" ]]; then
+  echo "clearing user session/cache data before capture..."
+  sudo /usr/local/bin/nivenia-prepare-clean-capture
+else
+  echo "skipping pre-capture cleanup (NIVENIA_SKIP_PRECAPTURE_CLEAN=1)"
+fi
 
 echo "capturing baseline and enabling frozen mode..."
 sudo /usr/local/bin/niveniactl freeze --policy "$POLICY_PATH" --state "$STATE_PATH"
@@ -76,4 +90,5 @@ echo "thaw until refreeze: sudo niveniactl thaw"
 echo "refreeze now: sudo niveniactl freeze --policy $POLICY_PATH --state $STATE_PATH"
 echo "manual update: sudo nivenia-update"
 echo "emergency disable: sudo nivenia-emergency-disable"
+echo "manual pre-capture cleanup: sudo nivenia-prepare-clean-capture"
 echo "recovery script: /var/lib/nivenia/recovery/nivenia-emergency-disable.sh"
