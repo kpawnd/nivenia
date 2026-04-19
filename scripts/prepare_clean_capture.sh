@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+MODE="run"
+if [[ "${1:-}" == "--preflight-only" ]]; then
+  MODE="preflight"
+fi
+
 if [[ "$(id -u)" -ne 0 ]]; then
   echo "run as root (use sudo)" >&2
   exit 1
@@ -62,6 +67,40 @@ user_home() {
   fi
 }
 
+verify_user_cache_ownership() {
+  local user="$1"
+  local home="$2"
+  local cache_dir="$home/Library/Caches"
+  local library_dir="$home/Library"
+  local owner=""
+
+  if ! id "$user" >/dev/null 2>&1; then
+    log "preflight failed: user $user is not resolvable"
+    return 1
+  fi
+
+  if [[ ! -d "$library_dir" ]]; then
+    log "preflight failed: missing directory $library_dir"
+    return 1
+  fi
+
+  owner="$(stat -f %Su "$library_dir" 2>/dev/null || true)"
+  if [[ "$owner" != "$user" ]]; then
+    log "preflight failed: $library_dir owner is '$owner', expected '$user'"
+    return 1
+  fi
+
+  if [[ -e "$cache_dir" ]]; then
+    owner="$(stat -f %Su "$cache_dir" 2>/dev/null || true)"
+    if [[ "$owner" != "$user" ]]; then
+      log "preflight failed: $cache_dir owner is '$owner', expected '$user'"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
 sanitize_user_home() {
   local user="$1"
   local home="$2"
@@ -107,14 +146,34 @@ kill_if_running "Microsoft Edge"
 kill_if_running "firefox"
 kill_if_running "cfprefsd"
 
+preflight_ok=1
 while IFS= read -r user; do
   home="$(user_home "$user")"
   if [[ -z "$home" || ! -d "$home" ]]; then
     continue
   fi
+
+  if ! verify_user_cache_ownership "$user" "$home"; then
+    preflight_ok=0
+  fi
+
+  if [[ "$MODE" == "preflight" ]]; then
+    continue
+  fi
+
   log "sanitizing user data for $user"
   sanitize_user_home "$user" "$home"
 done < <(list_real_users)
+
+if [[ "$preflight_ok" != "1" ]]; then
+  log "preflight failed: refusing to run cleanup"
+  exit 1
+fi
+
+if [[ "$MODE" == "preflight" ]]; then
+  log "preflight checks passed"
+  exit 0
+fi
 
 log "sanitizing system caches"
 clear_path "/Library/Caches"

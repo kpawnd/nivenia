@@ -71,9 +71,15 @@ sudo install -m 644 launchd/com.nivenia.restore.plist "$DAEMON_PATH"
 sudo install -m 644 launchd/com.nivenia.updater.plist "$UPDATER_DAEMON_PATH"
 
 if [[ "${NIVENIA_SKIP_PRECAPTURE_CLEAN:-0}" != "1" ]]; then
-  echo "clearing user session/cache data before capture..."
-  if ! sudo /usr/local/bin/nivenia-prepare-clean-capture; then
-    echo "warning: pre-capture cleanup failed; continuing with capture" >&2
+  echo "checking pre-capture cleanup safety..."
+  if sudo /usr/local/bin/nivenia-prepare-clean-capture --preflight-only; then
+    echo "clearing user session/cache data before capture..."
+    if ! sudo /usr/local/bin/nivenia-prepare-clean-capture; then
+      echo "warning: pre-capture cleanup failed; continuing with capture" >&2
+    fi
+  else
+    echo "warning: pre-capture cleanup skipped (ownership preflight failed)" >&2
+    echo "warning: fix user cache ownership or set NIVENIA_SKIP_PRECAPTURE_CLEAN=1" >&2
   fi
 else
   echo "skipping pre-capture cleanup (NIVENIA_SKIP_PRECAPTURE_CLEAN=1)"
