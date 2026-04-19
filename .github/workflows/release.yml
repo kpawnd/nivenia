@@ -76,9 +76,9 @@ jobs:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: artifacts
 
       - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/**/*
+          files: artifacts/**/*.tar.gz
