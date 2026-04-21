@@ -18,7 +18,6 @@ import (
 const (
 	integrityVersion     = 1
 	defaultIntegrityPath = "/var/lib/nivenia/integrity.json"
-	defaultSnapshotName  = "nivenia-baseline"
 )
 
 type SnapshotMetadata struct {
@@ -47,13 +46,6 @@ func IntegrityPath() string {
 		return env
 	}
 	return defaultIntegrityPath
-}
-
-func SnapshotName() string {
-	if env := strings.TrimSpace(os.Getenv("NIVENIA_SNAPSHOT_NAME")); env != "" {
-		return env
-	}
-	return defaultSnapshotName
 }
 
 func CaptureBaseline(policyPath, managedRoot string) error {

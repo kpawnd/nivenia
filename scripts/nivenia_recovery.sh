@@ -109,7 +109,7 @@ disable_restore() {
 
   mkdir -p "$sprefix"
   cat > "$sprefix/state.json" <<EOF
-{"mode":"thawed","last_restore_ok":true,"last_message":"emergency thaw","updated_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
+{"mode":"thawed","last_restore_ok":true,"last_message":"emergency thaw","updated_at_utc":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
 EOF
   echo "wrote thawed state at $sprefix/state.json"
 
