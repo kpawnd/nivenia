@@ -282,18 +282,30 @@ func mountSnapshotAt(device, snapshotName, mountPoint string) error {
 
 // rsyncRestore syncs src into dst, deleting files in dst that are absent in src.
 // rsync exit 24 (vanished source files) is treated as non-fatal.
-func rsyncRestore(src, dst string) error {
+// Returns a short stats summary ("N files transferred").
+func rsyncRestore(src, dst string) (string, error) {
 	srcDir := strings.TrimRight(src, "/") + "/"
 	dstDir := strings.TrimRight(dst, "/") + "/"
-	cmd := exec.Command("rsync", "-aH", "--delete", "--force", srcDir, dstDir)
+	cmd := exec.Command("rsync", "-aH", "--delete", "--force", "--stats", srcDir, dstDir)
 	out, err := cmd.CombinedOutput()
+	summary := parseRsyncStats(string(out))
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 24 {
-			return nil
+			return summary, nil
 		}
-		return fmt.Errorf("rsync %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
+		return summary, fmt.Errorf("rsync %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
 	}
-	return nil
+	return summary, nil
+}
+
+func parseRsyncStats(out string) string {
+	for _, line := range strings.Split(out, "\n") {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "Number of regular files transferred:") {
+			return t
+		}
+	}
+	return ""
 }
 
 func CaptureBaseline(managedRoot string) error {
@@ -312,6 +324,8 @@ func RestoreFromBaseline(managedRoot string, restorePaths []string) error {
 	volume := SnapshotVolume(managedRoot)
 	name := SnapshotName()
 
+	fmt.Fprintf(os.Stderr, "[restore] snapshot: %s\n", name)
+
 	if err := snapshotPreflight(volume, name, true); err != nil {
 		return err
 	}
@@ -320,6 +334,7 @@ func RestoreFromBaseline(managedRoot string, restorePaths []string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "[restore] device: %s\n", device)
 
 	mountPoint, err := os.MkdirTemp("", "nivenia-snap-*")
 	if err != nil {
@@ -330,10 +345,13 @@ func RestoreFromBaseline(managedRoot string, restorePaths []string) error {
 		_ = os.Remove(mountPoint)
 	}()
 
+	fmt.Fprintf(os.Stderr, "[restore] mounting snapshot...\n")
 	if err := mountSnapshotAt(device, name, mountPoint); err != nil {
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "[restore] mounted at %s\n", mountPoint)
 
+	start := time.Now()
 	for _, targetPath := range restorePaths {
 		rel, err := filepath.Rel(managedRoot, targetPath)
 		if err != nil {
@@ -344,13 +362,23 @@ func RestoreFromBaseline(managedRoot string, restorePaths []string) error {
 		}
 		srcPath := filepath.Join(mountPoint, rel)
 		if _, err := os.Stat(srcPath); err != nil {
-			fmt.Fprintf(os.Stderr, "[WARN] restore path not found in snapshot, skipping: %s\n", srcPath)
+			fmt.Fprintf(os.Stderr, "[restore] WARN: path not in snapshot, skipping: %s\n", targetPath)
 			continue
 		}
-		if err := rsyncRestore(srcPath, targetPath); err != nil {
+		t0 := time.Now()
+		fmt.Fprintf(os.Stderr, "[restore] syncing %s...\n", targetPath)
+		stats, err := rsyncRestore(srcPath, targetPath)
+		if err != nil {
 			return err
 		}
+		elapsed := time.Since(t0).Round(time.Millisecond)
+		if stats != "" {
+			fmt.Fprintf(os.Stderr, "[restore] done %s in %s (%s)\n", targetPath, elapsed, stats)
+		} else {
+			fmt.Fprintf(os.Stderr, "[restore] done %s in %s\n", targetPath, elapsed)
+		}
 	}
+	fmt.Fprintf(os.Stderr, "[restore] completed in %s\n", time.Since(start).Round(time.Millisecond))
 
 	return nil
 }
