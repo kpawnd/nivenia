@@ -9,7 +9,6 @@
     <string>/usr/local/libexec/niveniad</string>
     <string>--policy</string>
     <string>/etc/nivenia/policy.json</string>
-    <string>--require-loginwindow</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
