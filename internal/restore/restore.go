@@ -252,15 +252,48 @@ func createAPFSSnapshot(volume, name string) (string, error) {
 	return actual, nil
 }
 
-func revertAPFSSnapshot(volume, name string) error {
-	if name == "" {
-		return fmt.Errorf("snapshot name is empty")
+// deviceForVolume returns the /dev/diskXsY path for the given volume mount path.
+func deviceForVolume(volume string) (string, error) {
+	out, err := runDiskutil("info", volume)
+	if err != nil {
+		return "", err
 	}
-	if err := snapshotPreflight(volume, name, true); err != nil {
-		return err
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Device Identifier:") {
+			id := strings.TrimSpace(strings.TrimPrefix(trimmed, "Device Identifier:"))
+			if id != "" {
+				return "/dev/" + id, nil
+			}
+		}
 	}
-	_, err := runDiskutil("apfs", "revertToSnapshot", volume, "-name", name)
-	return err
+	return "", fmt.Errorf("device identifier not found for %s", volume)
+}
+
+// mountSnapshotAt mounts a named APFS snapshot read-only at mountPoint.
+// mount_apfs is available on all macOS versions that support APFS (10.12+).
+func mountSnapshotAt(device, snapshotName, mountPoint string) error {
+	cmd := exec.Command("mount_apfs", "-s", snapshotName, device, mountPoint)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("mount_apfs -s %q %s: %w: %s", snapshotName, device, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// rsyncRestore syncs src into dst, deleting files in dst that are absent in src.
+// rsync exit 24 (vanished source files) is treated as non-fatal.
+func rsyncRestore(src, dst string) error {
+	srcDir := strings.TrimRight(src, "/") + "/"
+	dstDir := strings.TrimRight(dst, "/") + "/"
+	cmd := exec.Command("rsync", "-aH", "--delete", "--force", srcDir, dstDir)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 24 {
+			return nil
+		}
+		return fmt.Errorf("rsync %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 
 func CaptureBaseline(managedRoot string) error {
@@ -272,9 +305,54 @@ func CaptureBaseline(managedRoot string) error {
 	return saveSnapshotState(volume, actual)
 }
 
-func RestoreFromBaseline(managedRoot string) error {
+// RestoreFromBaseline mounts the frozen snapshot read-only and rsyncs each
+// path in restorePaths from the snapshot back to the live volume.
+// This works on all macOS versions (Monterey–Sequoia) without private entitlements.
+func RestoreFromBaseline(managedRoot string, restorePaths []string) error {
 	volume := SnapshotVolume(managedRoot)
-	return revertAPFSSnapshot(volume, SnapshotName())
+	name := SnapshotName()
+
+	if err := snapshotPreflight(volume, name, true); err != nil {
+		return err
+	}
+
+	device, err := deviceForVolume(volume)
+	if err != nil {
+		return err
+	}
+
+	mountPoint, err := os.MkdirTemp("", "nivenia-snap-*")
+	if err != nil {
+		return fmt.Errorf("create mount point: %w", err)
+	}
+	defer func() {
+		_ = exec.Command("diskutil", "unmount", mountPoint).Run()
+		_ = os.Remove(mountPoint)
+	}()
+
+	if err := mountSnapshotAt(device, name, mountPoint); err != nil {
+		return err
+	}
+
+	for _, targetPath := range restorePaths {
+		rel, err := filepath.Rel(managedRoot, targetPath)
+		if err != nil {
+			return fmt.Errorf("restore path %s: %w", targetPath, err)
+		}
+		if rel == ".." || strings.HasPrefix(rel, "../") {
+			return fmt.Errorf("restore path %s is outside managed root %s", targetPath, managedRoot)
+		}
+		srcPath := filepath.Join(mountPoint, rel)
+		if _, err := os.Stat(srcPath); err != nil {
+			fmt.Fprintf(os.Stderr, "[WARN] restore path not found in snapshot, skipping: %s\n", srcPath)
+			continue
+		}
+		if err := rsyncRestore(srcPath, targetPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func isSnapshotVerbUnsupported(err error) bool {

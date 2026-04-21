@@ -133,7 +133,7 @@ func (e Engine) RunBootRestore() error {
 		return nil
 	}
 
-	if err := restore.RestoreFromBaseline(e.Policy.ManagedRoot); err != nil {
+	if err := restore.RestoreFromBaseline(e.Policy.ManagedRoot, e.Policy.RestorePaths); err != nil {
 		s.FailureCount++
 		s.LastRestoreOK = false
 		s.LastMessage = fmt.Sprintf("restore failed (%d/%d): %v", s.FailureCount, maxConsecutiveRestoreFailures, err)

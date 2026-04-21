@@ -128,7 +128,7 @@ revert_snapshot() {
   local volume="$1"
 
   if ! command -v diskutil >/dev/null 2>&1; then
-    echo "diskutil is not available; recovery shell is required" >&2
+    echo "diskutil is not available" >&2
     exit 1
   fi
 
@@ -152,25 +152,89 @@ revert_snapshot() {
     exit 1
   fi
 
-  if ! diskutil apfs listSnapshots "$volume" >/dev/null 2>&1; then
-    echo "failed to list snapshots for $volume" >&2
+  # Get device identifier (/dev/diskXsY) — required by mount_apfs
+  local device
+  device="$(diskutil info "$volume" | awk '/Device Identifier:/ {print $NF}')"
+  if [[ -z "$device" ]]; then
+    echo "could not determine device identifier for $volume" >&2
+    exit 1
+  fi
+  device="/dev/$device"
+  echo "device: $device"
+
+  # Verify the snapshot exists
+  if ! diskutil apfs listSnapshots "$volume" 2>/dev/null | grep -qF "$SNAPSHOT_NAME"; then
+    echo "snapshot '$SNAPSHOT_NAME' not found on $volume" >&2
     exit 1
   fi
 
-  if diskutil unmount "$volume" >/dev/null 2>&1; then
-    echo "unmounted $volume"
+  # Determine which subdirectories to restore.
+  # Reads restore_paths from the installed policy.json if available,
+  # otherwise defaults to Users (sufficient for a standard lab reset).
+  local restore_subdirs=("Users")
+  local policy_path="$volume/private/etc/nivenia/policy.json"
+  [[ -f "$policy_path" ]] || policy_path="$volume/etc/nivenia/policy.json"
+  if [[ -f "$policy_path" ]] && command -v python3 >/dev/null 2>&1; then
+    local configured_root
+    configured_root="$(python3 -c "import json; p=json.load(open('$policy_path')); print(p.get('managed_root','').rstrip('/'))" 2>/dev/null || true)"
+    if [[ -n "$configured_root" ]]; then
+      local abs_paths=()
+      mapfile -t abs_paths < <(python3 -c "import json; p=json.load(open('$policy_path')); [print(x) for x in p.get('restore_paths',[])]" 2>/dev/null || true)
+      if [[ ${#abs_paths[@]} -gt 0 ]]; then
+        restore_subdirs=()
+        for abs in "${abs_paths[@]}"; do
+          local rel="${abs#"${configured_root}/"}"
+          [[ "$rel" != "$abs" && -n "$rel" ]] && restore_subdirs+=("$rel")
+        done
+      fi
+    fi
   fi
 
-  if diskutil apfs revertToSnapshot "$volume" -name "$SNAPSHOT_NAME"; then
-    echo "revert completed"
-  else
-    echo "revert failed; ensure the volume is not in use and try again" >&2
+  # Mount the snapshot read-only using mount_apfs (available on all macOS with APFS)
+  local mount_point
+  mount_point="$(mktemp -d)"
+  _cleanup_snap_mount() {
+    diskutil unmount "$mount_point" >/dev/null 2>&1 || true
+    rmdir "$mount_point" >/dev/null 2>&1 || true
+  }
+  trap _cleanup_snap_mount RETURN
+
+  echo "mounting snapshot..."
+  if ! mount_apfs -s "$SNAPSHOT_NAME" "$device" "$mount_point"; then
+    echo "failed to mount snapshot $SNAPSHOT_NAME on $device" >&2
+    exit 1
+  fi
+  echo "mounted at $mount_point"
+
+  # Rsync each restore subdir from the frozen snapshot back to the live volume
+  local ok=1
+  for subdir in "${restore_subdirs[@]}"; do
+    local src="$mount_point/$subdir/"
+    local dst="$volume/$subdir/"
+    if [[ ! -e "$mount_point/$subdir" ]]; then
+      echo "WARNING: $subdir not found in snapshot, skipping" >&2
+      continue
+    fi
+    echo "restoring $subdir..."
+    if rsync -aH --delete --force "$src" "$dst"; then
+      echo "restored $subdir"
+    else
+      local rc=$?
+      if [[ $rc -eq 24 ]]; then
+        echo "restored $subdir (some files vanished mid-transfer, non-fatal)"
+      else
+        echo "rsync failed for $subdir (exit $rc)" >&2
+        ok=0
+      fi
+    fi
+  done
+
+  if [[ "$ok" != "1" ]]; then
+    echo "revert completed with errors" >&2
     exit 1
   fi
 
-  if diskutil mount "$volume" >/dev/null 2>&1; then
-    echo "remounted $volume"
-  fi
+  echo "revert completed"
 }
 
 case "$SUBCMD" in
