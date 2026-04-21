@@ -7,10 +7,11 @@ if [[ -n "$SUBCMD" ]]; then
 fi
 
 TARGET_ROOT="${1:-}"
-SNAPSHOT_NAME="${2:-${NIVENIA_SNAPSHOT_NAME:-nivenia-baseline}}"
+SNAPSHOT_NAME="${2:-${NIVENIA_SNAPSHOT_NAME:-}}"
 
 usage() {
   echo "usage: $0 <disable|revert> [volume] [snapshot-name]" >&2
+  echo "example: $0 revert /Volumes/\"Macintosh HD - Data\"" >&2
   echo "example: $0 revert /Volumes/\"Macintosh HD - Data\" nivenia-baseline" >&2
 }
 
@@ -79,6 +80,18 @@ resolve_root() {
   auto_detect_volume
 }
 
+read_snapshot_state_name() {
+  local root="$1"
+  local state_path="$root/var/lib/nivenia/snapshot.json"
+  local name=""
+
+  if [[ -f "$state_path" ]]; then
+    name="$(grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' "$state_path" | head -n 1 | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/')"
+  fi
+
+  printf '%s' "$name"
+}
+
 disable_restore() {
   local root="$1"
   local lprefix="$root/Library/LaunchDaemons"
@@ -122,6 +135,13 @@ revert_snapshot() {
   if [[ -z "$volume" ]]; then
     echo "volume not found; specify the target volume" >&2
     exit 1
+  fi
+
+  if [[ -z "$SNAPSHOT_NAME" ]]; then
+    SNAPSHOT_NAME="$(read_snapshot_state_name "$volume")"
+  fi
+  if [[ -z "$SNAPSHOT_NAME" ]]; then
+    SNAPSHOT_NAME="nivenia-baseline"
   fi
 
   echo "volume: $volume"

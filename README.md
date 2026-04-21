@@ -85,7 +85,7 @@ Restore behavior:
 - boot restore waits for the configured `managed_root` to be available before restore
 - restore daemon runs once at boot (not continuously during uptime)
 - restore aborts if an interactive console user is already logged in
-- restore uses APFS snapshots (`diskutil apfs snapshot/revertToSnapshot`)
+- restore uses APFS snapshots (`diskutil apfs snapshot/revertToSnapshot`; on Monterey snapshot creation falls back to `tmutil snapshot`)
 - restore verifies integrity before revert (snapshot metadata, policy hash, and installed Nivenia binary/script hashes)
 - if integrity verification fails, restore is refused and mode is forced to `thaw`
 - restore failures are tracked, but mode is not auto-changed to thawed
@@ -104,6 +104,7 @@ Workflow: `.github/workflows/release.yml`
 - first `freeze` captures baseline and can take time
 - snapshot capture and restore use APFS snapshots (volume-wide)
 - state is stored at `/var/lib/nivenia/state.json`
+- snapshot name is stored at `/var/lib/nivenia/snapshot.json` (used when snapshot names are auto-generated)
 - recovery script is installed at `/var/lib/nivenia/recovery/nivenia-recovery.sh` for Recovery mode use
 - restore uses a lock file to prevent concurrent runs (`/var/lib/nivenia/restore.lock`)
 
@@ -111,7 +112,7 @@ Snapshot guidance:
 
 - APFS snapshot revert is volume-wide; you cannot exclude directories the way rsync does.
 - For DeepFreeze-like isolation, create a dedicated APFS volume and set `managed_root` to that volume's mount point.
-- Optional overrides: set `NIVENIA_SNAPSHOT_VOLUME` and `NIVENIA_SNAPSHOT_NAME` if you need a custom volume or snapshot name.
+- Optional overrides: set `NIVENIA_SNAPSHOT_VOLUME` if you need a custom volume. `NIVENIA_SNAPSHOT_NAME` is honored when `diskutil apfs snapshot` is available; on Monterey, snapshot names are auto-generated and stored in `/var/lib/nivenia/snapshot.json`.
 
 ## Recovery mode
 
@@ -138,10 +139,10 @@ bash "/Volumes/Macintosh HD - Data/var/lib/nivenia/recovery/nivenia-recovery.sh"
 
 This forces thawed mode and disables Nivenia launch daemons.
 
-To revert a snapshot in Recovery:
+To revert a snapshot in Recovery (uses `/var/lib/nivenia/snapshot.json` when present):
 
 ```sh
-bash "/Volumes/Macintosh HD - Data/var/lib/nivenia/recovery/nivenia-recovery.sh" revert "/Volumes/Macintosh HD - Data" "nivenia-baseline"
+bash "/Volumes/Macintosh HD - Data/var/lib/nivenia/recovery/nivenia-recovery.sh" revert "/Volumes/Macintosh HD - Data"
 ```
 
 If auto-detection fails, set a volume explicitly:

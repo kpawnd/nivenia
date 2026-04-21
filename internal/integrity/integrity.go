@@ -258,6 +258,14 @@ func snapshotMetadata(volume, name string) (SnapshotMetadata, error) {
 	var currentName string
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Snapshot Name:") {
+			if currentName == name {
+				break
+			}
+			currentName = strings.TrimSpace(strings.TrimPrefix(trimmed, "Snapshot Name:"))
+			current = []string{trimmed}
+			continue
+		}
 		if strings.HasPrefix(trimmed, "Name:") {
 			if currentName == name {
 				break
