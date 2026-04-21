@@ -143,11 +143,6 @@ func snapshotPreflight(volume, name string, requireSnapshot bool) error {
 	if !isAPFSInfo(info) {
 		return fmt.Errorf("snapshot volume is not APFS: %s", strings.TrimSpace(info))
 	}
-	if volume == "/System/Volumes/Data" {
-		fmt.Fprintln(os.Stderr, "[WARN] snapshot scope is the full Data volume; system/user changes will be reverted")
-		fmt.Fprintln(os.Stderr, "[WARN] for DeepFreeze-like isolation, prefer a dedicated APFS volume and set NIVENIA_SNAPSHOT_VOLUME")
-	}
-
 	names, err := listAPFSSnapshotNames(volume)
 	if err != nil {
 		return err

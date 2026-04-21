@@ -29,7 +29,10 @@ func Load(path string) (Policy, error) {
 		p.ManagedRoot = "/System/Volumes/Data"
 	}
 	if len(p.RestorePaths) == 0 {
-		p.RestorePaths = []string{filepath.Join(p.ManagedRoot, "Users")}
+		p.RestorePaths = []string{
+			filepath.Join(p.ManagedRoot, "Users"),
+			filepath.Join(p.ManagedRoot, "Applications"),
+		}
 	}
 	if p.StateFile == "" {
 		p.StateFile = "/var/lib/nivenia/state.json"

@@ -4,6 +4,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
+	"time"
 
 	"nivenia/internal/config"
 	"nivenia/internal/integrity"
@@ -12,28 +14,91 @@ import (
 	"nivenia/internal/state"
 )
 
+const (
+	ansiReset  = "\033[0m"
+	ansiBold   = "\033[1m"
+	ansiDim    = "\033[2m"
+	ansiRed    = "\033[31m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiCyan   = "\033[36m"
+	ansiWhite  = "\033[97m"
+)
+
+func isTTY() bool {
+	fi, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+func printStatusPretty(s state.State) {
+	rule := ansiCyan + "  " + strings.Repeat("━", 44) + ansiReset
+
+	var modeColor, modeSymbol string
+	switch s.Mode {
+	case state.ModeFrozen:
+		modeColor = ansiCyan + ansiBold
+		modeSymbol = "●"
+	case state.ModeThawed:
+		modeColor = ansiYellow + ansiBold
+		modeSymbol = "○"
+	case state.ModeThawOnce:
+		modeColor = ansiYellow
+		modeSymbol = "◑"
+	default:
+		modeColor = ansiReset
+		modeSymbol = "·"
+	}
+	modeStr := strings.ToUpper(string(s.Mode))
+
+	var restoreColor, restoreSymbol string
+	if s.LastRestoreOK {
+		restoreColor = ansiGreen + ansiBold
+		restoreSymbol = "✓"
+	} else {
+		restoreColor = ansiRed + ansiBold
+		restoreSymbol = "✗"
+	}
+
+	updated := s.UpdatedAtUTC
+	if t, err := time.Parse(time.RFC3339, s.UpdatedAtUTC); err == nil {
+		updated = t.UTC().Format("Mon 02 Jan 2006, 15:04 UTC")
+	}
+
+	msg := s.LastMessage
+	if len(msg) > 34 {
+		msg = msg[:33] + "…"
+	}
+
+	fmt.Println()
+	fmt.Println(rule)
+	fmt.Printf("   %s%sNIVENIA%s\n", ansiBold, ansiWhite, ansiReset)
+	fmt.Println(rule)
+	fmt.Printf("   %-10s%s%s %s%s\n", "Mode", modeColor, modeSymbol, modeStr, ansiReset)
+	fmt.Printf("   %-10s%s%s%s  %s\n", "Restore", restoreColor, restoreSymbol, ansiReset, msg)
+	fmt.Printf("   %s%-10s%s%s\n", ansiDim, "Updated", updated, ansiReset)
+	fmt.Println(rule)
+	fmt.Println()
+}
+
 func usage() {
 	fmt.Print(`Nivenia control CLI
 
 Usage:
-	niveniactl [--state PATH] [--policy PATH] <command>
+    niveniactl [--state PATH] [--policy PATH] <command>
 
 Commands:
-	status       Show current freeze mode and last restore status
-	freeze       Capture a new baseline and set mode to frozen
-	thaw         Set mode to thawed (no restore on boot)
-	thaw-once    Skip restore for next boot only, then return to frozen
-	help         Show this help
+    status       Show current freeze mode and last restore status
+    freeze       Capture a new baseline and set mode to frozen
+    thaw         Set mode to thawed (no restore on boot)
+    thaw-once    Skip restore for next boot only, then return to frozen
+    help         Show this help
 
 Options:
-	--state PATH   State file path (default: /var/lib/nivenia/state.json)
-	--policy PATH  Policy file path (default: /etc/nivenia/policy.json)
-
-Examples:
-	sudo niveniactl status
-	sudo niveniactl freeze --policy /etc/nivenia/policy.json --state /var/lib/nivenia/state.json
-	sudo niveniactl thaw
-	sudo niveniactl thaw-once
+    --state PATH   State file path (default: /var/lib/nivenia/state.json)
+    --policy PATH  Policy file path (default: /etc/nivenia/policy.json)
 `)
 }
 
@@ -66,7 +131,12 @@ func main() {
 
 	switch cmd {
 	case "status":
-		fmt.Printf("mode=%s last_restore_ok=%t message=%q updated=%s\n", s.Mode, s.LastRestoreOK, s.LastMessage, s.UpdatedAtUTC)
+		if isTTY() {
+			printStatusPretty(s)
+		} else {
+			fmt.Printf("mode=%s last_restore_ok=%t message=%q updated=%s\n",
+				s.Mode, s.LastRestoreOK, s.LastMessage, s.UpdatedAtUTC)
+		}
 		return
 	case "freeze":
 		p, err := config.Load(*policyPath)

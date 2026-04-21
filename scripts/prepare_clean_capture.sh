@@ -11,8 +11,13 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 
+if [ -t 1 ]; then
+  _PREP_DIM=$'\033[2m'; _PREP_RESET=$'\033[0m'
+else
+  _PREP_DIM=''; _PREP_RESET=''
+fi
 log() {
-  echo "[prep] $1"
+  printf '%s[prep] %s%s\n' "${_PREP_DIM}" "$1" "${_PREP_RESET}"
 }
 
 kill_if_running() {
