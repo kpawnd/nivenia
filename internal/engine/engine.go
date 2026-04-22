@@ -101,14 +101,18 @@ func (e Engine) RunBootRestore() error {
 	case state.ModeThawed:
 		s.LastRestoreOK = true
 		s.LastMessage = "thawed mode: restore skipped"
-		_ = state.Save(e.Policy.StateFile, s)
+		if err := state.Save(e.Policy.StateFile, s); err != nil {
+			appendLog(e.Policy.LogFile, "warn: could not save state: "+err.Error())
+		}
 		appendLog(e.Policy.LogFile, s.LastMessage)
 		return nil
 	case state.ModeThawOnce:
 		s.Mode = state.ModeFrozen
 		s.LastRestoreOK = true
 		s.LastMessage = "thaw_once consumed: restore skipped this boot"
-		_ = state.Save(e.Policy.StateFile, s)
+		if err := state.Save(e.Policy.StateFile, s); err != nil {
+			appendLog(e.Policy.LogFile, "warn: could not save state after thaw_once: "+err.Error())
+		}
 		appendLog(e.Policy.LogFile, s.LastMessage)
 		return nil
 	}

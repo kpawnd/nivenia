@@ -22,7 +22,6 @@ const (
 	ansiGreen  = "\033[32m"
 	ansiYellow = "\033[33m"
 	ansiCyan   = "\033[36m"
-	ansiWhite  = "\033[97m"
 )
 
 func isTTY() bool {
@@ -73,8 +72,6 @@ func printStatusPretty(s state.State) {
 	}
 
 	fmt.Println()
-	fmt.Println(rule)
-	fmt.Printf("   %s%sNIVENIA%s\n", ansiBold, ansiWhite, ansiReset)
 	fmt.Println(rule)
 	fmt.Printf("   %-10s%s%s %s%s\n", "Mode", modeColor, modeSymbol, modeStr, ansiReset)
 	fmt.Printf("   %-10s%s%s%s  %s\n", "Restore", restoreColor, restoreSymbol, ansiReset, msg)

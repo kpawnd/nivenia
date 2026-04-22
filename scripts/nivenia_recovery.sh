@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "$(id -u)" -ne 0 ]]; then
+  echo "run as root (use sudo)" >&2
+  exit 1
+fi
+
 SUBCMD="${1:-}"
 if [[ -n "$SUBCMD" ]]; then
   shift
@@ -197,7 +202,7 @@ revert_snapshot() {
     diskutil unmount "$mount_point" >/dev/null 2>&1 || true
     rmdir "$mount_point" >/dev/null 2>&1 || true
   }
-  trap _cleanup_snap_mount RETURN
+  trap _cleanup_snap_mount EXIT
 
   echo "mounting snapshot..."
   if ! mount_apfs -s "$SNAPSHOT_NAME" "$device" "$mount_point"; then

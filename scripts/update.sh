@@ -137,8 +137,6 @@ install -m 644 "$TMP_DIR/com.nivenia.updater.plist" "$UPDATER_PLIST_PATH"
 
 echo "$VERSION" > "$STATE_DIR/version"
 
-launchctl bootout system "$RESTORE_PLIST_PATH" >/dev/null 2>&1 || true
-launchctl bootstrap system "$RESTORE_PLIST_PATH"
 launchctl bootout system "$UPDATER_PLIST_PATH" >/dev/null 2>&1 || true
 launchctl bootstrap system "$UPDATER_PLIST_PATH"
 
