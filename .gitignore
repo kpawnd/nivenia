@@ -1,0 +1,9 @@
+bin/
+*.log
+*.out
+*.err
+/niveniad
+/niveniactl
+/niveniad.exe
+/niveniactl.exe
+dist/

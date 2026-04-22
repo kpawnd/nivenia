@@ -1,0 +1,9 @@
+{
+  "managed_root": "/System/Volumes/Data",
+  "restore_paths": [
+    "/System/Volumes/Data/Users",
+    "/System/Volumes/Data/Applications"
+  ],
+  "state_file": "/var/lib/nivenia/state.json",
+  "log_file": "/var/log/nivenia.log"
+}
