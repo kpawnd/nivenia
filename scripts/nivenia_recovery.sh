@@ -225,7 +225,9 @@ revert_snapshot() {
       echo "restored $subdir"
     else
       local rc=$?
-      if [[ $rc -eq 24 ]]; then
+      if [[ $rc -eq 23 ]]; then
+        echo "restored $subdir (some hard links could not be replicated, non-fatal)"
+      elif [[ $rc -eq 24 ]]; then
         echo "restored $subdir (some files vanished mid-transfer, non-fatal)"
       else
         echo "rsync failed for $subdir (exit $rc)" >&2

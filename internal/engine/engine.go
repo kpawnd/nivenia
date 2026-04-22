@@ -1,10 +1,13 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 
 	"nivenia/internal/config"
@@ -16,14 +19,32 @@ const maxConsecutiveRestoreFailures = 3
 
 var errRestoreAlreadyRunning = errors.New("restore already running")
 
-const restoreLockStaleAfter = 30 * time.Minute
+const defaultLockPath = "/var/lib/nivenia/restore.lock"
 
+// Engine runs boot restores. RestoreFn and LockFile are optional overrides
+// used in tests; production code leaves them nil/empty and gets the defaults.
 type Engine struct {
-	Policy config.Policy
+	Policy    config.Policy
+	RestoreFn func(ctx context.Context, managedRoot string, restorePaths []string) error
+	LockFile  string
 }
 
 func New(p config.Policy) Engine {
 	return Engine{Policy: p}
+}
+
+func (e Engine) lockPath() string {
+	if e.LockFile != "" {
+		return e.LockFile
+	}
+	return defaultLockPath
+}
+
+func (e Engine) restoreBaseline(ctx context.Context) error {
+	if e.RestoreFn != nil {
+		return e.RestoreFn(ctx, e.Policy.ManagedRoot, e.Policy.RestorePaths)
+	}
+	return restore.RestoreFromBaseline(ctx, e.Policy.ManagedRoot, e.Policy.RestorePaths)
 }
 
 func appendLog(path, msg string) {
@@ -36,27 +57,40 @@ func appendLog(path, msg string) {
 	_, _ = f.WriteString(time.Now().UTC().Format(time.RFC3339) + " " + msg + "\n")
 }
 
-func writeLockMetadata(path string) error {
-	meta := time.Now().UTC().Format(time.RFC3339) + "\n"
-	return os.WriteFile(path, []byte(meta), 0o644)
-}
-
+// lockLooksActive returns true if the lock file belongs to a living process.
+// It reads the PID written by acquireRestoreLock and sends signal 0; if the
+// process is gone (e.g. after a reboot or crash) the lock is considered stale.
 func lockLooksActive(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	lines := strings.SplitN(strings.TrimSpace(string(data)), "\n", 2)
+	if len(lines) >= 1 {
+		if pid, parseErr := strconv.Atoi(strings.TrimSpace(lines[0])); parseErr == nil && pid > 0 {
+			return pidIsAlive(pid)
+		}
+	}
+	// Legacy lock file without PID: fall back to a short mtime window.
 	fi, err := os.Stat(path)
 	if err != nil {
 		return false
 	}
-	return time.Since(fi.ModTime()) < restoreLockStaleAfter
+	return time.Since(fi.ModTime()) < 5*time.Minute
 }
 
 func acquireRestoreLock(path string) error {
 	for attempts := 0; attempts < 2; attempts++ {
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 		if err == nil {
+			// Write PID before closing so there is never a window where the lock
+			// file exists but is empty (which would look stale to lockLooksActive).
+			meta := fmt.Sprintf("%d\n%s\n", os.Getpid(), time.Now().UTC().Format(time.RFC3339))
+			_, werr := f.WriteString(meta)
 			_ = f.Close()
-			if err := writeLockMetadata(path); err != nil {
+			if werr != nil {
 				_ = os.Remove(path)
-				return err
+				return werr
 			}
 			return nil
 		}
@@ -76,13 +110,13 @@ func acquireRestoreLock(path string) error {
 	return errRestoreAlreadyRunning
 }
 
-func (e Engine) RunBootRestore() error {
+func (e Engine) RunBootRestore(ctx context.Context) error {
 	s, err := state.Load(e.Policy.StateFile)
 	if err != nil {
 		return err
 	}
 
-	lockPath := "/var/lib/nivenia/restore.lock"
+	lockPath := e.lockPath()
 	_ = os.MkdirAll(filepath.Dir(lockPath), 0o755)
 	err = acquireRestoreLock(lockPath)
 	if err != nil {
@@ -119,7 +153,7 @@ func (e Engine) RunBootRestore() error {
 
 	appendLog(e.Policy.LogFile, "restore started")
 
-	if err := restore.RestoreFromBaseline(e.Policy.ManagedRoot, e.Policy.RestorePaths); err != nil {
+	if err := e.restoreBaseline(ctx); err != nil {
 		s.FailureCount++
 		s.LastRestoreOK = false
 		s.LastMessage = fmt.Sprintf("restore failed (%d/%d): %v", s.FailureCount, maxConsecutiveRestoreFailures, err)

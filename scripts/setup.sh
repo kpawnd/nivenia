@@ -118,7 +118,7 @@ if ! sudo /usr/local/bin/nivenia-prepare-clean-capture; then
 fi
 
 step "Capturing baseline and enabling frozen mode"
-sudo /usr/local/bin/niveniactl freeze --policy "$POLICY_PATH" --state "$STATE_PATH"
+sudo /usr/local/bin/niveniactl --policy "$POLICY_PATH" --state "$STATE_PATH" freeze
 ok "Baseline captured"
 
 step "Verifying restore"
@@ -141,12 +141,12 @@ sudo launchctl bootout system "$RESTART_DAEMON_PATH" >/dev/null 2>&1 || true
 sudo launchctl bootstrap system "$RESTART_DAEMON_PATH"
 ok "Launch daemons registered"
 
-sudo /usr/local/bin/niveniactl status --state "$STATE_PATH"
+sudo /usr/local/bin/niveniactl --state "$STATE_PATH" status
 
 printf '%s  Quick reference%s\n' "${BOLD}" "${RESET}"
 printf '  %s%-36s%s %s\n' "${DIM}" "thaw temporarily"         "${RESET}" "sudo niveniactl thaw-once"
 printf '  %s%-36s%s %s\n' "${DIM}" "thaw until refreeze"      "${RESET}" "sudo niveniactl thaw"
-printf '  %s%-36s%s %s\n' "${DIM}" "refreeze"                 "${RESET}" "sudo niveniactl freeze --policy $POLICY_PATH --state $STATE_PATH"
+printf '  %s%-36s%s %s\n' "${DIM}" "refreeze"                 "${RESET}" "sudo niveniactl --policy $POLICY_PATH --state $STATE_PATH freeze"
 printf '  %s%-36s%s %s\n' "${DIM}" "manual update"            "${RESET}" "sudo nivenia-update"
 printf '  %s%-36s%s %s\n' "${DIM}" "emergency disable"        "${RESET}" "sudo nivenia-recovery disable"
 printf '  %s%-36s%s %s\n' "${DIM}" "emergency revert"         "${RESET}" "sudo nivenia-recovery revert"

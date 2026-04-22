@@ -65,7 +65,7 @@ All state-changing commands require `sudo`.
 | Command | Effect |
 |---|---|
 | `sudo niveniactl status` | Show current mode and last restore result |
-| `sudo niveniactl freeze --policy /etc/nivenia/policy.json` | Capture a new baseline and set mode to frozen |
+| `sudo niveniactl --policy /etc/nivenia/policy.json freeze` | Capture a new baseline and set mode to frozen |
 | `sudo niveniactl thaw` | Skip all restores until manually refrozen |
 | `sudo niveniactl thaw-once` | Skip the next boot restore only, then return to frozen |
 | `sudo nivenia-update` | Check for and apply an update |
