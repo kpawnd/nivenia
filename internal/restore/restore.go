@@ -127,6 +127,10 @@ func isAPFSInfo(info string) bool {
 	return false
 }
 
+func isVolumeNotReady(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "-69854")
+}
+
 func snapshotPreflight(volume, name string, requireSnapshot bool) error {
 	if err := diskutilAvailable(); err != nil {
 		return err
@@ -144,7 +148,17 @@ func snapshotPreflight(volume, name string, requireSnapshot bool) error {
 	if !isAPFSInfo(info) {
 		return fmt.Errorf("snapshot volume is not APFS: %s", strings.TrimSpace(info))
 	}
-	names, err := listAPFSSnapshotNames(volume)
+	// diskutil apfs listSnapshots can transiently return -69854 ("A disk with a
+	// mount point is required") on fast reboots even after diskutil info
+	// succeeds. Retry with backoff before giving up.
+	var names []string
+	for attempt := 0; attempt < 15; attempt++ {
+		names, err = listAPFSSnapshotNames(volume)
+		if err == nil || !isVolumeNotReady(err) {
+			break
+		}
+		time.Sleep(10 * time.Second)
+	}
 	if err != nil {
 		return err
 	}
