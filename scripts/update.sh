@@ -73,10 +73,9 @@ current_version() {
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
 ARCH="$(uname -m)"
 case "$ARCH" in
-  x86_64)  ARCH="amd64" ;;
-  arm64)   ARCH="arm64" ;;
+  x86_64) ARCH="amd64" ;;
   *)
-    log "unsupported architecture: $ARCH"
+    log "unsupported architecture: $ARCH (Intel x86_64 only)"
     exit 1
     ;;
 esac
