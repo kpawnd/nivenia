@@ -52,7 +52,8 @@ Before capturing the baseline, setup wipes:
 - Safari, Chrome, Edge, Firefox: cookies, history, sessions, login data
 - Microsoft Teams, Microsoft 365 (Word, Excel, Outlook, OneDrive)
 - Adobe Creative Cloud, Blender, Azure Data Studio, Android Studio, Cisco Packet Tracer
-- `~/Library/Caches`, `/Library/Caches`
+- `~/Library/Caches`
+- `/Library/Caches` — **except** `com.apple.loginwindow/`, `Desktop Pictures/`, and `com.apple.desktop.admin.png` (preserves any custom wallpaper applied via script before freeze)
 
 It does **not** touch `/etc/sudoers`, system preferences, or installed applications.
 
@@ -135,13 +136,9 @@ Updater log: `/var/log/nivenia-updater.log`
 
 ---
 
-## Scheduled nightly restart
+## Scheduled restart
 
-A LaunchDaemon fires at 03:00 every night and reboots the machine — triggering the restore — as long as no interactive user session is active. If a user is logged in, the restart is skipped and the machine is checked again the next night.
-
-This ensures lab machines are returned to baseline overnight without disrupting active sessions.
-
-The daemon is installed automatically by setup. No manual configuration is needed.
+Nivenia does **not** ship its own restart scheduler. Scheduled power-on and power-off are handled by macOS `pmset` (configured out-of-band for each lab), and the boot restore fires automatically on the next startup.
 
 ---
 
@@ -187,7 +184,7 @@ Community-tested configurations. Add a row or fill in a result by opening a PR a
 | Monterey | 12 | ☐ | |
 | Ventura | 13 | ☐ | |
 | Sonoma | 14 | ✓ | Boot restore verified. Desktop, /Applications, files up to 50 GB. |
-| Sequoia | 15 | ☐ | |
+| Sequoia | 15 | ✓ | Boot restore verified. Directories created in Desktop/Documents were purged on next boot. Applications installed into `/Applications` by a non-admin user were also purged. Requires Full Disk Access to be granted to `niveniad` in System Settings → Privacy & Security. |
 
 ---
 
@@ -240,7 +237,6 @@ bash scripts/setup.sh
 /usr/local/libexec/niveniad                        restore daemon
 /usr/local/libexec/nivenia-updater                 updater script
 /usr/local/libexec/nivenia-prepare-clean-capture   pre-capture cleanup script
-/usr/local/libexec/nivenia-scheduled-restart       nightly restart script
 /usr/local/bin/niveniactl                          CLI control tool
 /usr/local/bin/nivenia-update                      updater alias
 /usr/local/bin/nivenia-recovery                    recovery tool
@@ -250,7 +246,6 @@ bash scripts/setup.sh
 /var/lib/nivenia/recovery/                         recovery scripts (accessible from Recovery OS)
 /Library/LaunchDaemons/com.nivenia.restore.plist
 /Library/LaunchDaemons/com.nivenia.updater.plist
-/Library/LaunchDaemons/com.nivenia.scheduled-restart.plist
 ```
 
 ---

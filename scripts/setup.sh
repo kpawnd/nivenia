@@ -6,7 +6,6 @@ POLICY_PATH="${NIVENIA_POLICY_PATH:-/etc/nivenia/policy.json}"
 STATE_PATH="${NIVENIA_STATE_PATH:-/var/lib/nivenia/state.json}"
 DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.restore.plist"
 UPDATER_DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.updater.plist"
-RESTART_DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.scheduled-restart.plist"
 
 # ── colors ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -64,12 +63,6 @@ RECOVERY_SCRIPT_SOURCE="scripts/nivenia_recovery.sh"
 PREPARE_CLEAN_CAPTURE_SOURCE="scripts/prepare_clean_capture.sh"
 [[ -f "$PREPARE_CLEAN_CAPTURE_SOURCE" ]] || PREPARE_CLEAN_CAPTURE_SOURCE="prepare_clean_capture.sh"
 
-SCHEDULED_RESTART_SOURCE="scripts/nivenia_scheduled_restart.sh"
-[[ -f "$SCHEDULED_RESTART_SOURCE" ]] || SCHEDULED_RESTART_SOURCE="nivenia_scheduled_restart.sh"
-
-RESTART_PLIST_SOURCE="launchd/com.nivenia.scheduled-restart.plist"
-[[ -f "$RESTART_PLIST_SOURCE" ]] || RESTART_PLIST_SOURCE="com.nivenia.scheduled-restart.plist"
-
 step "Building niveniad and niveniactl"
 go build -o niveniad ./cmd/niveniad
 go build -o niveniactl ./cmd/niveniactl
@@ -89,11 +82,14 @@ sudo rm -f /usr/local/bin/nivenia-emergency-disable /usr/local/bin/nivenia-emerg
 sudo rm -f /var/lib/nivenia/recovery/nivenia-emergency-disable.sh /var/lib/nivenia/recovery/nivenia-emergency-revert.sh
 sudo install -m 755 "$PREPARE_CLEAN_CAPTURE_SOURCE" /usr/local/libexec/nivenia-prepare-clean-capture
 sudo install -m 755 "$PREPARE_CLEAN_CAPTURE_SOURCE" /usr/local/bin/nivenia-prepare-clean-capture
-sudo install -m 755 "$SCHEDULED_RESTART_SOURCE"     /usr/local/libexec/nivenia-scheduled-restart
 sudo install -m 644 configs/policy.json "$POLICY_PATH"
 sudo install -m 644 launchd/com.nivenia.restore.plist          "$DAEMON_PATH"
 sudo install -m 644 launchd/com.nivenia.updater.plist          "$UPDATER_DAEMON_PATH"
-sudo install -m 644 "$RESTART_PLIST_SOURCE"                    "$RESTART_DAEMON_PATH"
+# Remove scheduled-restart daemon if upgrading from a version that installed it;
+# scheduled power-on/off is handled by pmset instead.
+sudo launchctl bootout system /Library/LaunchDaemons/com.nivenia.scheduled-restart.plist >/dev/null 2>&1 || true
+sudo rm -f /Library/LaunchDaemons/com.nivenia.scheduled-restart.plist
+sudo rm -f /usr/local/libexec/nivenia-scheduled-restart
 ok "Installation complete"
 
 step "Configuring log rotation"
@@ -137,8 +133,6 @@ sudo launchctl bootout system "$DAEMON_PATH"         >/dev/null 2>&1 || true
 sudo launchctl bootstrap system "$DAEMON_PATH"
 sudo launchctl bootout system "$UPDATER_DAEMON_PATH" >/dev/null 2>&1 || true
 sudo launchctl bootstrap system "$UPDATER_DAEMON_PATH"
-sudo launchctl bootout system "$RESTART_DAEMON_PATH" >/dev/null 2>&1 || true
-sudo launchctl bootstrap system "$RESTART_DAEMON_PATH"
 ok "Launch daemons registered"
 
 sudo /usr/local/bin/niveniactl --state "$STATE_PATH" status

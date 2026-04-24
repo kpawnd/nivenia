@@ -241,9 +241,17 @@ if [[ "$MODE" == "preflight" ]]; then
   exit 0
 fi
 
-log "sanitizing system caches"
-clear_path "/Library/Caches"
-mkdir -p "/Library/Caches" >/dev/null 2>&1 || true
+log "sanitizing system caches (preserving desktop wallpaper cache)"
+# Wipe /Library/Caches contents but keep the desktop-wallpaper cache so a
+# custom wallpaper applied before freeze survives into the baseline and is
+# restored after user changes.
+if [[ -d "/Library/Caches" ]]; then
+  find "/Library/Caches" -mindepth 1 -maxdepth 1 \
+    ! -name "com.apple.loginwindow" \
+    ! -name "Desktop Pictures" \
+    ! -name "com.apple.desktop.admin.png" \
+    -exec rm -rf {} + >/dev/null 2>&1 || true
+fi
 chown root:wheel "/Library/Caches" >/dev/null 2>&1 || true
 chmod 755 "/Library/Caches" >/dev/null 2>&1 || true
 
