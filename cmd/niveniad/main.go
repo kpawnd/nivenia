@@ -22,11 +22,30 @@ import (
 // The default "dev" is what a plain `go build` produces.
 var version = "dev"
 
+// volumeWaitDeadline is how long niveniad will wait for the Data
+// volume to be mounted and APFS-registered before giving up. It needs
+// to cover the worst-case "machine off for weeks, fsck runs on first
+// boot, APFS housekeeping pass" scenario seen on lab Macs after long
+// idle periods. 10 minutes is generous enough that any disk doing
+// real work will finish within the window, while still bounded so a
+// genuinely-broken disk doesn't stall the boot indefinitely.
+//
+// Override via NIVENIA_VOLUME_WAIT_SECONDS for fleets with a known
+// slower disk (HDDs, large RAID volumes). Empty/invalid env → default.
+func volumeWaitDeadline() time.Duration {
+	if v := os.Getenv("NIVENIA_VOLUME_WAIT_SECONDS"); v != "" {
+		if secs, err := time.ParseDuration(v + "s"); err == nil && secs > 0 {
+			return secs
+		}
+	}
+	return 10 * time.Minute
+}
+
 func waitForManagedVolume(path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("managed_root is empty")
 	}
-	deadline := time.Now().Add(5 * time.Minute)
+	deadline := time.Now().Add(volumeWaitDeadline())
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			// os.Stat can return nil before diskutil has fully registered the

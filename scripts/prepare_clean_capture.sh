@@ -186,6 +186,115 @@ sanitize_user_home() {
   clear_path "$home/Library/Application Support/Cisco Packet Tracer"
   clear_path "$home/Library/Preferences/com.cisco.packettracer.plist"
 
+  # ── Code editors and IDEs ──────────────────────────────────────────────────
+  # VS Code (stable + insiders) — Application Support holds workspace state,
+  # extensions, signed-in account tokens for GitHub/Microsoft, log files,
+  # cookies, and the entire user settings tree. ~/.vscode holds extensions
+  # installed by the user.
+  clear_path "$home/Library/Application Support/Code"
+  clear_path "$home/Library/Application Support/Code - Insiders"
+  clear_path "$home/Library/Application Support/VSCodium"
+  clear_path "$home/.vscode"
+  clear_path "$home/.vscode-insiders"
+  clear_path "$home/.vscode-oss"
+
+  # JetBrains family — IntelliJ IDEA, PyCharm, WebStorm, GoLand, CLion, etc.
+  # The toolbox config and per-IDE state both live here. Trial registration
+  # tokens, recent projects, GitHub auth all under these paths.
+  clear_path "$home/Library/Application Support/JetBrains"
+  clear_path "$home/Library/Caches/JetBrains"
+  clear_path "$home/Library/Logs/JetBrains"
+  clear_path "$home/Library/Preferences/com.jetbrains.toolbox.plist"
+  clear_path "$home/.idea"
+
+  # Sublime Text 2/3/4 — same shape, separate dirs.
+  clear_path "$home/Library/Application Support/Sublime Text"
+  clear_path "$home/Library/Application Support/Sublime Text 2"
+  clear_path "$home/Library/Application Support/Sublime Text 3"
+
+  # Atom (sunset but still on some lab machines)
+  clear_path "$home/Library/Application Support/Atom"
+  clear_path "$home/.atom"
+
+  # ── Dev tooling and source control ─────────────────────────────────────────
+  clear_path "$home/Library/Application Support/GitHub Desktop"
+  clear_path "$home/Library/Application Support/com.elgato.StreamDeck"
+  clear_path "$home/.gitconfig"
+  clear_path "$home/.git-credentials"
+  clear_path "$home/.ssh/known_hosts"
+  # Don't wipe ~/.ssh entirely — admin may have provisioned id_ed25519 etc.
+
+  # Docker Desktop (logged-in Docker Hub account, settings, image cache)
+  clear_path "$home/Library/Containers/com.docker.docker"
+  clear_path "$home/Library/Group Containers/group.com.docker"
+  clear_path "$home/Library/Application Support/Docker Desktop"
+
+  # Postman, Insomnia (API tooling — workspaces and signed-in accounts)
+  clear_path "$home/Library/Application Support/Postman"
+  clear_path "$home/Library/Application Support/Insomnia"
+
+  # ── Communication / collaboration ──────────────────────────────────────────
+  clear_path "$home/Library/Application Support/Slack"
+  clear_path "$home/Library/Containers/com.tinyspeck.slackmacgap"
+  clear_path "$home/Library/Application Support/discord"
+  clear_path "$home/Library/Application Support/discordcanary"
+  clear_path "$home/Library/Application Support/zoom.us"
+  clear_path "$home/Library/Application Support/us.zoom.xos"
+  clear_path "$home/Library/Caches/us.zoom.xos"
+  clear_path "$home/Library/Application Support/Webex"
+  clear_path "$home/Library/Application Support/Cisco Webex Meetings"
+
+  # ── Productivity ───────────────────────────────────────────────────────────
+  clear_path "$home/Library/Application Support/Notion"
+  clear_path "$home/Library/Application Support/Obsidian"
+  clear_path "$home/Library/Application Support/Figma"
+  clear_path "$home/Library/Application Support/Spotify"
+  clear_path "$home/Library/Application Support/Dropbox"
+  clear_path "$home/Library/Application Support/Box"
+
+  # ── Blanket sandboxed-app wipe ─────────────────────────────────────────────
+  # macOS App Store apps and many Apple-bundled apps store their per-user
+  # data under ~/Library/Containers/<bundle-id>. This includes Mail.app,
+  # Notes, Messages, Reminders, Safari (sandboxed), TextEdit, etc.
+  # For a lab, "signed in" state for ANY sandboxed app — including ones we
+  # don't know about — lives in this tree, so blanket-wiping it is the
+  # one move that catches the long tail of "what about app X" questions.
+  #
+  # Trade-off: this removes Mail mailboxes, Messages history, Notes, etc.
+  # If your lab admin has been signed in to those during baseline prep,
+  # that data leaves with the wipe. For a true student-lab setup that's
+  # the desired behaviour. To preserve specific containers, opt out by
+  # setting NIVENIA_PRESERVE_CONTAINERS to a colon-separated list of
+  # bundle IDs (e.g. "com.apple.mail:com.apple.Notes").
+  if [[ -d "$home/Library/Containers" ]]; then
+    local preserve_pattern=""
+    if [[ -n "${NIVENIA_PRESERVE_CONTAINERS:-}" ]]; then
+      preserve_pattern="$NIVENIA_PRESERVE_CONTAINERS"
+    fi
+    while IFS= read -r -d '' container; do
+      local cname
+      cname="$(basename "$container")"
+      local skip=0
+      if [[ -n "$preserve_pattern" ]]; then
+        IFS=':' read -ra _PRESERVE <<< "$preserve_pattern"
+        for keep in "${_PRESERVE[@]}"; do
+          [[ "$cname" == "$keep" ]] && skip=1 && break
+        done
+      fi
+      [[ "$skip" == "1" ]] && continue
+      rm -rf "$container" >/dev/null 2>&1 || true
+    done < <(find "$home/Library/Containers" -mindepth 1 -maxdepth 1 -print0 2>/dev/null || true)
+  fi
+
+  # Group Containers — shared between sister apps (Office suite,
+  # Microsoft auth helpers, etc.). Same blanket wipe rationale.
+  clear_dir_contents "$home/Library/Group Containers"
+
+  # HTTP cookies / modern HTTPStorages (used by WKWebView-based apps,
+  # i.e. most Electron and native macOS apps that embed web views).
+  clear_dir_contents "$home/Library/HTTPStorages"
+  clear_dir_contents "$home/Library/Cookies"
+
   ensure_owned_dir "$user" "$home/Library/Caches"
   clear_dir_contents "$home/Library/Caches"
 }
@@ -209,6 +318,34 @@ if [[ "$MODE" != "preflight" ]]; then
   kill_if_running "Azure Data Studio"
   kill_if_running "Blender"
   kill_if_running "PacketTracer"
+  # Editors — Electron apps re-create their state on quit if running.
+  kill_if_running "Code"
+  kill_if_running "Code - Insiders"
+  kill_if_running "VSCodium"
+  kill_if_running "Sublime Text"
+  kill_if_running "Atom"
+  # JetBrains IDEs are launched via per-IDE binaries; toolbox manager too.
+  kill_if_running "idea"
+  kill_if_running "pycharm"
+  kill_if_running "webstorm"
+  kill_if_running "goland"
+  kill_if_running "clion"
+  kill_if_running "JetBrains Toolbox"
+  # Communication and dev tooling
+  kill_if_running "Slack"
+  kill_if_running "Discord"
+  kill_if_running "DiscordCanary"
+  kill_if_running "zoom.us"
+  kill_if_running "Postman"
+  kill_if_running "Insomnia"
+  kill_if_running "Notion"
+  kill_if_running "Obsidian"
+  kill_if_running "Figma"
+  kill_if_running "Spotify"
+  kill_if_running "Docker Desktop"
+  kill_if_running "GitHub Desktop"
+  # cfprefsd holds plist file handles open and reads on demand; killing it
+  # forces preference flushes so subsequent rm -rf doesn't race a write.
   kill_if_running "cfprefsd"
 fi
 
