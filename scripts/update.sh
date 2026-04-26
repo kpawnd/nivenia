@@ -48,8 +48,8 @@ if ! [[ "$OS_MAJOR" =~ ^[0-9]+$ ]]; then
   echo "could not parse macOS version: $OS_VERSION" >&2
   exit 1
 fi
-if (( OS_MAJOR < 12 || OS_MAJOR > 15 )); then
-  echo "unsupported macOS $OS_VERSION: only Monterey (12) through Sequoia (15) are supported" >&2
+if (( OS_MAJOR != 15 )); then
+  echo "unsupported macOS $OS_VERSION: Nivenia targets macOS Sequoia (15) only" >&2
   exit 1
 fi
 

@@ -71,8 +71,11 @@ if ! [[ "$OS_MAJOR" =~ ^[0-9]+$ ]]; then
   fail "could not parse macOS version: $OS_VERSION"
   exit 1
 fi
-if (( OS_MAJOR < 12 || OS_MAJOR > 15 )); then
-  fail "unsupported macOS $OS_VERSION: only Monterey (12) through Sequoia (15) are supported"
+# Sequoia (15) only. See internal/platform/support.go for the rationale —
+# the snapshot creation surface, openrsync flag set, and TCC story all
+# differ on older macOS, and the test matrix is tight.
+if (( OS_MAJOR != 15 )); then
+  fail "unsupported macOS $OS_VERSION: Nivenia targets macOS Sequoia (15) only"
   exit 1
 fi
 

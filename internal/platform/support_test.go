@@ -40,8 +40,13 @@ func TestMajorVersion_Invalid(t *testing.T) {
 	}
 }
 
-func TestSupportedRange(t *testing.T) {
-	if MinSupportedMajor >= MaxSupportedMajor {
-		t.Errorf("MinSupportedMajor (%d) must be < MaxSupportedMajor (%d)", MinSupportedMajor, MaxSupportedMajor)
+// SupportedMajor is the single macOS major Nivenia targets. The
+// project is intentionally narrowed to Sequoia (15) — see the package
+// header for the reasoning. Any change to this constant should be
+// accompanied by review of every macOS-specific call site (rsync,
+// diskutil, tmutil, mount_apfs, TCC handling).
+func TestSupportedMajorIsSequoia(t *testing.T) {
+	if SupportedMajor != 15 {
+		t.Errorf("SupportedMajor: got %d, want 15 (Sequoia)", SupportedMajor)
 	}
 }

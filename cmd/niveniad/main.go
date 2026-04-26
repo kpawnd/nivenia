@@ -1,3 +1,17 @@
+// niveniad — boot-time restore daemon.
+//
+// Lifecycle:
+//  1. launchd starts us at boot via com.nivenia.restore.plist.
+//  2. We confirm the OS is Sequoia and load the policy.
+//  3. We wait for the managed Data volume to come online (APFS can
+//     report partial readiness for several seconds during fast boots).
+//  4. We probe Full Disk Access (warns only — never blocks).
+//  5. We hand control to engine.RunBootRestore which acquires the
+//     lock, verifies the snapshot, mounts it, and rsyncs.
+//
+// Every step writes structured log events to /var/log/nivenia.log (and
+// the per-run rsync transcripts go to /var/log/nivenia/rsync-*.log)
+// so post-mortem triage doesn't depend on stitching together stderr.
 package main
 
 import (
@@ -15,6 +29,7 @@ import (
 
 	"nivenia/internal/config"
 	"nivenia/internal/engine"
+	"nivenia/internal/nivlog"
 	"nivenia/internal/platform"
 )
 
@@ -22,16 +37,11 @@ import (
 // The default "dev" is what a plain `go build` produces.
 var version = "dev"
 
-// volumeWaitDeadline is how long niveniad will wait for the Data
-// volume to be mounted and APFS-registered before giving up. It needs
-// to cover the worst-case "machine off for weeks, fsck runs on first
-// boot, APFS housekeeping pass" scenario seen on lab Macs after long
-// idle periods. 10 minutes is generous enough that any disk doing
-// real work will finish within the window, while still bounded so a
-// genuinely-broken disk doesn't stall the boot indefinitely.
-//
-// Override via NIVENIA_VOLUME_WAIT_SECONDS for fleets with a known
-// slower disk (HDDs, large RAID volumes). Empty/invalid env → default.
+// volumeWaitDeadline is how long we wait for the Data volume to be
+// mounted and APFS-registered before giving up. 10 minutes is generous
+// enough that fsck + APFS housekeeping after a long-idle boot can
+// finish, while still bounded so a genuinely-broken disk doesn't stall
+// indefinitely. NIVENIA_VOLUME_WAIT_SECONDS overrides for slower hardware.
 func volumeWaitDeadline() time.Duration {
 	if v := os.Getenv("NIVENIA_VOLUME_WAIT_SECONDS"); v != "" {
 		if secs, err := time.ParseDuration(v + "s"); err == nil && secs > 0 {
@@ -41,20 +51,28 @@ func volumeWaitDeadline() time.Duration {
 	return 10 * time.Minute
 }
 
-func waitForManagedVolume(path string) error {
+func waitForManagedVolume(log *nivlog.Logger, path string) error {
 	if strings.TrimSpace(path) == "" {
 		return fmt.Errorf("managed_root is empty")
 	}
 	deadline := time.Now().Add(volumeWaitDeadline())
+	attempt := 0
 	for time.Now().Before(deadline) {
+		attempt++
 		if _, err := os.Stat(path); err == nil {
-			// os.Stat can return nil before diskutil has fully registered the
-			// volume with the APFS driver, triggering error -69854 on the next
-			// diskutil call. Verify diskutil can reach the volume too.
-			out, err := exec.Command("diskutil", "info", path).CombinedOutput()
-			if err == nil && isAPFSVolume(string(out)) {
+			out, dErr := exec.Command("diskutil", "info", path).CombinedOutput()
+			if dErr == nil && isAPFSVolume(string(out)) {
+				if attempt > 1 {
+					log.Info("volume.ready", "path", path, "attempts", attempt)
+				}
 				return nil
 			}
+		}
+		if attempt%30 == 0 {
+			// Every minute, log that we're still waiting so the
+			// transcript shows steady progress instead of a silent
+			// hang.
+			log.Info("volume.waiting", "path", path, "elapsed", time.Since(time.Now().Add(-time.Duration(attempt*2)*time.Second)).Round(time.Second).String())
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -68,35 +86,12 @@ func isAPFSVolume(info string) bool {
 		strings.Contains(upper, "APFS VOLUME")
 }
 
-// probeFullDiskAccess does a best-effort detection of whether this
-// LaunchDaemon has been granted Full Disk Access. On macOS Sonoma+ (and
-// strictly enforced on Sequoia 15+), TCC gates root reads of certain
-// user-library directories — even processes running as uid 0 get
-// EPERM/EACCES if the binary's bundle isn't on the FDA list.
-//
-// We probe by attempting to enumerate ~user/Library/Calendars for the
-// first real user we find. Calendars is created automatically the first
-// time a user signs in to iCal/Calendar.app, so it's reliably present
-// on lab Macs that have ever been used. If the directory exists and
-// listing it yields a permission error while running as root, that is
-// an unambiguous TCC denial.
-//
-// We DO NOT abort boot on a positive denial signal. The actual restore
-// will still attempt rsync, and if FDA is required for the restore
-// paths it will fail with a clear rsync error. The probe just emits a
-// warning to stderr (captured by launchd into niveniad.err.log) so the
-// admin sees the cause when triaging.
-func probeFullDiskAccess() {
-	// We need a real user — skip system slots and the public Shared
-	// folder. /Users entries are normally directories owned by the
-	// user (UID >= 500); we're not parsing /etc/passwd here, just
-	// looking for a likely-real account directory.
+// probeFullDiskAccess: best-effort detection of TCC blocking root
+// reads of user library subdirectories. Logs a warning but never
+// blocks boot — many lab Macs don't have any TCC-gated content.
+func probeFullDiskAccess(log *nivlog.Logger) {
 	users, err := os.ReadDir("/Users")
 	if err != nil {
-		// Without /Users we can't probe; staying silent is correct
-		// (the daemon may be running on a freshly imaged box where
-		// no users have been created yet — restore would have
-		// nothing to do anyway).
 		return
 	}
 	for _, u := range users {
@@ -104,29 +99,20 @@ func probeFullDiskAccess() {
 		if !u.IsDir() || name == "Shared" || name == "Guest" || strings.HasPrefix(name, ".") {
 			continue
 		}
-		// Calendars is one TCC-protected library subdirectory; Mail
-		// would also work but isn't created until a user adds an
-		// account. Calendars exists from first login.
 		probe := filepath.Join("/Users", name, "Library", "Calendars")
 		if _, statErr := os.Stat(probe); statErr != nil {
-			// Path doesn't exist for this user; try the next.
 			continue
 		}
-		_, readErr := os.ReadDir(probe)
-		if readErr == nil {
-			// Read succeeded — FDA is granted (or TCC isn't
-			// gating this path). Either way, we're good.
+		if _, readErr := os.ReadDir(probe); readErr == nil {
+			log.Info("fda.probe.ok", "path", probe)
+			return
+		} else if errors.Is(readErr, os.ErrPermission) || strings.Contains(readErr.Error(), "operation not permitted") {
+			log.Warn("fda.missing",
+				"path", probe,
+				"hint", "grant Full Disk Access to /usr/local/libexec/niveniad in System Settings → Privacy & Security, or push a PPPC profile via MDM",
+			)
 			return
 		}
-		if errors.Is(readErr, os.ErrPermission) || strings.Contains(readErr.Error(), "operation not permitted") {
-			fmt.Fprintf(os.Stderr,
-				"[FDA] WARNING: cannot read %s as root (permission denied). "+
-					"Likely cause: niveniad lacks Full Disk Access. "+
-					"Grant via System Settings → Privacy & Security → Full Disk Access (add /usr/local/libexec/niveniad), "+
-					"or push a PPPC profile via MDM. Boot restore may fail or skip protected user files.\n", probe)
-			return
-		}
-		// Some other error (I/O, ENOENT race) — try the next user.
 	}
 }
 
@@ -135,11 +121,6 @@ func main() {
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
-	// --version is the smoke test the updater runs on a freshly-staged
-	// binary before it replaces the live one. It proves the executable is
-	// linkable and the right architecture for this OS. We keep the platform
-	// check in place so a new binary that doesn't support the running macOS
-	// version fails the smoke test instead of being installed.
 	if err := platform.EnsureSupportedMacOS(); err != nil {
 		fmt.Fprintf(os.Stderr, "niveniad: %v\n", err)
 		os.Exit(1)
@@ -155,25 +136,29 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := waitForManagedVolume(p.ManagedRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "niveniad preboot check failed: %v\n", err)
+	osVer, _ := platform.MacOSProductVersion()
+	logger := nivlog.New(p.LogFile, "/var/log/nivenia", "niveniad", version, osVer)
+	logger.Info("boot.invoked",
+		"os", osVer,
+		"policy_path", *policyPath,
+	)
+
+	if err := waitForManagedVolume(logger, p.ManagedRoot); err != nil {
+		logger.Error("volume.timeout", "path", p.ManagedRoot, "error", err.Error())
 		os.Exit(1)
 	}
 
-	// Best-effort FDA detection — emits a stderr warning if it looks
-	// like Full Disk Access is missing. Never blocks boot; the actual
-	// rsync will produce its own errors if FDA is genuinely required
-	// for the restore paths in this policy.
-	probeFullDiskAccess()
+	probeFullDiskAccess(logger)
 
-	// Cancel the context on SIGTERM or SIGINT so the rsync child is killed
-	// before we exit, preventing orphaned rsyncs on daemon stop or reboot.
+	// Cancel the context on SIGTERM/SIGINT so the rsync child is
+	// killed before we exit, preventing orphaned rsyncs.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
 
 	e := engine.New(p)
+	e.Log = logger
 	if err := e.RunBootRestore(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "niveniad restore failed: %v\n", err)
+		logger.Error("boot.fail", "error", err.Error())
 		os.Exit(2)
 	}
 }

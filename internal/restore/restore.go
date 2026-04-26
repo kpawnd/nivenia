@@ -1,36 +1,93 @@
+// Package restore owns snapshot creation and snapshot-to-live
+// restoration for the boot daemon.
+//
+// Sequoia-specific design notes (read these before changing anything):
+//
+//  1. There is no `diskutil apfs snapshot` verb on macOS. We previously
+//     called one and it worked sometimes only because of a transient
+//     diskutil bug; the verb is genuinely not exposed. Sequoia's only
+//     supported way to create an APFS snapshot from userland is
+//     `tmutil localsnapshot`, which auto-names the snapshot
+//     `com.apple.TimeMachine.<UTC-date>.local`.
+//
+//     We do not get to choose the snapshot name. We parse the date out
+//     of tmutil's stdout and verify the snapshot appears in
+//     `diskutil apfs listSnapshots`. This is the single source of truth
+//     for the new baseline; we then save the name to snapshot.json.
+//
+//  2. Sequoia ships `openrsync` as /usr/bin/rsync — a clean-room
+//     reimplementation that calls itself "rsync 2.6.9 compatible".
+//     Two things bit us hard with openrsync:
+//
+//     a. The `-E` flag (extended attributes via Apple's AppleDouble
+//        scheme) causes openrsync to enumerate non-existent `._foo`
+//        siblings for files that have xattrs, then explode with
+//        `openat: No such file or directory` on those phantom files.
+//        The transfer becomes partial AND openrsync exits 0, so the
+//        old "trust the exit code" path silently shipped a half-restore.
+//
+//        Fix: drop -E. We accept the tradeoff that com.apple.quarantine
+//        and Finder tags do not survive restore. For a lab Mac this is
+//        acceptable; the snapshot itself is the curated baseline so the
+//        apps in it are inherently trusted by the admin.
+//
+//     b. openrsync does NOT use the classic exit codes 23 (partial
+//        transfer) and 24 (vanished source). Old code that special-cased
+//        those was dead on Sequoia. The exit codes we actually see are
+//        0 (success), 1 (syntax/usage), 2 (protocol), 5/10/11/12 (I/O
+//        and protocol errors), 30 (timeout). All non-zero exits are
+//        fatal; a zero exit is only success if stderr is also clean.
+//
+//  3. /Applications on Sequoia is a firmlink to /System/Volumes/Data/
+//     Applications. The directory itself cannot be unlinkat'd by anyone,
+//     including root (`Operation not permitted`). Any "wipe and recopy"
+//     fallback is therefore wrong. rsync into the existing directory
+//     works — it manipulates contents, not the firmlink target itself.
 package restore
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
-	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
+
+	"nivenia/internal/nivlog"
 )
 
 const (
-	// snapshotNamePrefix is the constant prefix every Nivenia-created
-	// snapshot starts with. The remainder is a UTC timestamp in ISO 8601
-	// basic format (no colons, valid in APFS snapshot names) so each
-	// freeze produces a unique name that never collides with a previous
-	// baseline. Using fresh names is the only way to make freeze atomic:
-	// we keep the OLD snapshot live until the new one has been confirmed,
-	// then delete the old one. With a fixed name, the create-then-delete
-	// dance had to delete first (because APFS rejects duplicate names),
-	// which left a window where a transient create failure orphaned the
-	// machine with NO baseline.
-	snapshotNamePrefix = "nivenia-"
-	snapshotStatePath  = "/var/lib/nivenia/snapshot.json"
-	// snapshotTimestampLayout matches Go's reference time. The format is
-	// "20060102T150405Z" — basic ISO 8601, UTC. Letters are alphanumeric
-	// and the "Z" suffix is unambiguous, so the resulting name is safe
-	// for diskutil/APFS (no colons, no spaces, no slashes).
-	snapshotTimestampLayout = "20060102T150405Z"
+	snapshotStatePath = "/var/lib/nivenia/snapshot.json"
+
+	// snapshotNamePrefix is the prefix Time Machine uses for every
+	// local snapshot it creates via `tmutil localsnapshot`. We don't
+	// pick the name — TM does — but we recognise this prefix so we
+	// can identify our snapshots when listing.
+	tmSnapshotPrefix = "com.apple.TimeMachine."
+	tmSnapshotSuffix = ".local"
+
+	// listSnapshotRetries / listSnapshotDelay control the retry on the
+	// "-69854 a disk with a mount point is required" race that occurs
+	// during fast boots. Sequoia's diskutil sometimes returns this
+	// transient error before APFS has fully attached the volume, even
+	// after `diskutil info` reports success.
+	listSnapshotRetries = 30
+	listSnapshotDelay   = 5 * time.Second
+
+	// mountSnapshotRetries handles the same family of transient errors
+	// at mount_apfs time. Time Machine taking its own hourly snapshot
+	// at the same instant can briefly contend.
+	mountSnapshotRetries = 6
+	mountSnapshotDelay   = 10 * time.Second
 )
+
+// snapshotDateRegex pulls the date string out of the tmutil
+// localsnapshot success line: "Created local snapshot with date: 2026-04-26-223736".
+var snapshotDateRegex = regexp.MustCompile(`(?m)^Created local snapshot with date:\s*([0-9-]+)\s*$`)
 
 type snapshotState struct {
 	Name         string `json:"name"`
@@ -38,14 +95,9 @@ type snapshotState struct {
 	CreatedAtUTC string `json:"created_at_utc"`
 }
 
-// SnapshotName returns the name of the snapshot we should restore from.
-// At boot it must be the snapshot we previously CAPTURED, not a freshly
-// generated one. Source of truth is /var/lib/nivenia/snapshot.json which
-// is written atomically once the snapshot is confirmed to exist.
-//
-// NIVENIA_SNAPSHOT_NAME (env) is honoured only as a last-resort fallback
-// for situations where snapshot.json is unreadable (Recovery boot, manual
-// debugging). It is not the normal source of truth.
+// SnapshotName returns the snapshot we should restore from at boot.
+// Source of truth is /var/lib/nivenia/snapshot.json, which is written
+// atomically once the snapshot is confirmed to exist.
 func SnapshotName() string {
 	if state, ok := loadSnapshotState(); ok {
 		return state.Name
@@ -56,19 +108,14 @@ func SnapshotName() string {
 	return ""
 }
 
-// freshSnapshotName generates a new unique name for a freeze operation.
-// Because we never reuse names, the old snapshot stays live until the
-// new one is confirmed, making freeze rollback-safe.
-//
-// Test/manual override via NIVENIA_SNAPSHOT_NAME is supported but emits
-// a warning: pinning a fixed name reintroduces the create-after-delete
-// race that this module was redesigned to eliminate.
-func freshSnapshotName() string {
-	if env := strings.TrimSpace(os.Getenv("NIVENIA_SNAPSHOT_NAME")); env != "" {
-		fmt.Fprintln(os.Stderr, "[WARN] NIVENIA_SNAPSHOT_NAME set; using fixed name disables atomic rollback on freeze failure")
+// SnapshotVolume picks the volume to snapshot/restore. NIVENIA_SNAPSHOT_VOLUME
+// is honoured for tests and for hardware where the data volume is
+// somewhere unusual; otherwise we use the policy's managed_root.
+func SnapshotVolume(managedRoot string) string {
+	if env := strings.TrimSpace(os.Getenv("NIVENIA_SNAPSHOT_VOLUME")); env != "" {
 		return env
 	}
-	return snapshotNamePrefix + time.Now().UTC().Format(snapshotTimestampLayout)
+	return managedRoot
 }
 
 func loadSnapshotState() (snapshotState, bool) {
@@ -90,27 +137,50 @@ func saveSnapshotState(volume, name string) error {
 	if strings.TrimSpace(name) == "" {
 		return fmt.Errorf("snapshot name is empty")
 	}
-	state := snapshotState{
+	st := snapshotState{
 		Name:         name,
 		Volume:       volume,
 		CreatedAtUTC: time.Now().UTC().Format(time.RFC3339),
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(snapshotStatePath), 0o755); err != nil {
+	dir := filepath.Dir(snapshotStatePath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(snapshotStatePath, data, 0o644)
+	tmp := snapshotStatePath + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, snapshotStatePath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
-func SnapshotVolume(managedRoot string) string {
-	if env := strings.TrimSpace(os.Getenv("NIVENIA_SNAPSHOT_VOLUME")); env != "" {
-		return env
-	}
-	return managedRoot
-}
+// ── External commands ─────────────────────────────────────────────────────────
 
 func runDiskutil(args ...string) (string, error) {
 	cmd := exec.Command("diskutil", args...)
@@ -119,113 +189,6 @@ func runDiskutil(args ...string) (string, error) {
 		return string(out), fmt.Errorf("diskutil %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return string(out), nil
-}
-
-func diskutilAvailable() error {
-	if _, err := exec.LookPath("diskutil"); err != nil {
-		return fmt.Errorf("diskutil not found: %w", err)
-	}
-	return nil
-}
-
-func isAPFSInfo(info string) bool {
-	upper := strings.ToUpper(info)
-	if strings.Contains(upper, "FILE SYSTEM PERSONALITY: APFS") {
-		return true
-	}
-	if strings.Contains(upper, "TYPE (BUNDLE): APFS") {
-		return true
-	}
-	if strings.Contains(upper, "APFS VOLUME") {
-		return true
-	}
-	return false
-}
-
-func isVolumeNotReady(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "-69854")
-}
-
-func snapshotPreflight(volume, name string, requireSnapshot bool) error {
-	if err := diskutilAvailable(); err != nil {
-		return err
-	}
-	if strings.TrimSpace(volume) == "" {
-		return fmt.Errorf("snapshot volume is empty")
-	}
-	if _, err := os.Stat(volume); err != nil {
-		return fmt.Errorf("snapshot volume not found: %s: %w", volume, err)
-	}
-	info, err := runDiskutil("info", volume)
-	if err != nil {
-		return err
-	}
-	if !isAPFSInfo(info) {
-		return fmt.Errorf("snapshot volume is not APFS: %s", strings.TrimSpace(info))
-	}
-	// diskutil apfs listSnapshots can transiently return -69854 ("A disk with a
-	// mount point is required") on fast reboots even after diskutil info
-	// succeeds. Retry with backoff before giving up.
-	var names []string
-	for attempt := 0; attempt < 15; attempt++ {
-		names, err = listAPFSSnapshotNames(volume)
-		if err == nil || !isVolumeNotReady(err) {
-			break
-		}
-		time.Sleep(10 * time.Second)
-	}
-	if err != nil {
-		return err
-	}
-	if requireSnapshot {
-		found := false
-		for _, existing := range names {
-			if existing == name {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return fmt.Errorf("snapshot %q not found on %s (available: %v)\n"+
-				"  hint: snapshot may have been deleted under storage pressure — "+
-				"run 'niveniactl freeze' to capture a new baseline", name, volume, names)
-		}
-	}
-	return nil
-}
-
-func listAPFSSnapshotNamesFromOutput(out string) ([]string, error) {
-	lines := strings.Split(out, "\n")
-	var names []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(line, "Snapshot Name:"):
-			name := strings.TrimSpace(strings.TrimPrefix(line, "Snapshot Name:"))
-			if name != "" {
-				names = append(names, name)
-			}
-		case strings.HasPrefix(line, "Name:"):
-			name := strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
-			if name != "" {
-				names = append(names, name)
-			}
-		}
-	}
-	return names, nil
-}
-
-func listAPFSSnapshotNames(volume string) ([]string, error) {
-	out, err := runDiskutil("apfs", "listSnapshots", volume)
-	if err != nil {
-		return nil, err
-	}
-	return listAPFSSnapshotNamesFromOutput(out)
-}
-
-func deleteAPFSSnapshot(volume, name string) error {
-	_, err := runDiskutil("apfs", "deleteSnapshot", volume, "-name", name)
-	return err
 }
 
 func runTmutil(args ...string) (string, error) {
@@ -237,115 +200,17 @@ func runTmutil(args ...string) (string, error) {
 	return string(out), nil
 }
 
-func isUnsupportedAPFSSnapshotVerb(err error) bool {
-	if err == nil {
-		return false
-	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "did not recognize apfs verb \"snapshot\"") || strings.Contains(text, "verb \"snapshot\" is not recognized")
+// ── Volume helpers ────────────────────────────────────────────────────────────
+
+func isAPFSInfo(info string) bool {
+	upper := strings.ToUpper(info)
+	return strings.Contains(upper, "FILE SYSTEM PERSONALITY: APFS") ||
+		strings.Contains(upper, "TYPE (BUNDLE): APFS") ||
+		strings.Contains(upper, "APFS VOLUME")
 }
 
-func snapshotNameSet(names []string) map[string]struct{} {
-	set := make(map[string]struct{}, len(names))
-	for _, name := range names {
-		set[name] = struct{}{}
-	}
-	return set
-}
-
-func diffSnapshotNames(before, after []string) []string {
-	seen := snapshotNameSet(before)
-	var created []string
-	for _, name := range after {
-		if _, ok := seen[name]; !ok {
-			created = append(created, name)
-		}
-	}
-	return created
-}
-
-func createAPFSSnapshotWithTmutil(volume string, beforeNames []string) (string, error) {
-	if _, err := runTmutil("localsnapshot"); err != nil {
-		return "", err
-	}
-	afterNames, err := listAPFSSnapshotNames(volume)
-	if err != nil {
-		return "", err
-	}
-	created := diffSnapshotNames(beforeNames, afterNames)
-	if len(created) != 1 {
-		return "", fmt.Errorf("could not identify created snapshot on %s (before=%v after=%v)", volume, beforeNames, afterNames)
-	}
-	return created[0], nil
-}
-
-// createAPFSSnapshot performs an atomic-swap freeze: it creates a new
-// snapshot under a unique name, persists the new name to snapshot.json,
-// and only then deletes the previous baseline. If any step fails, the
-// previous baseline remains live and intact — the machine is never left
-// without a working restore point.
-//
-// Some macOS builds do not expose a diskutil APFS snapshot-creation verb.
-// In that case we fall back to tmutil localsnapshot and record the actual
-// snapshot name that was created.
-func createAPFSSnapshot(volume, newName string) (string, error) {
-	if newName == "" {
-		return "", fmt.Errorf("snapshot name is empty")
-	}
-	if err := snapshotPreflight(volume, newName, false); err != nil {
-		return "", err
-	}
-
-	beforeNames, err := listAPFSSnapshotNames(volume)
-	if err != nil {
-		return "", err
-	}
-
-	createdName := newName
-	if _, err := runDiskutil("apfs", "snapshot", volume, "-name", newName); err != nil {
-		if !isUnsupportedAPFSSnapshotVerb(err) {
-			return "", err
-		}
-		createdName, err = createAPFSSnapshotWithTmutil(volume, beforeNames)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		afterNames, err := listAPFSSnapshotNames(volume)
-		if err != nil {
-			return "", err
-		}
-		created := diffSnapshotNames(beforeNames, afterNames)
-		if len(created) != 1 {
-			return "", fmt.Errorf("could not identify created snapshot on %s (before=%v after=%v)", volume, beforeNames, afterNames)
-		}
-		createdName = created[0]
-	}
-
-	// Snapshot create succeeded. Update snapshot.json with the new name
-	// BEFORE deleting the previous baseline so a power cut between
-	// success and delete leaves the new name persisted (the old snapshot
-	// is then orphaned but harmless). Boot restore reads the new name
-	// and finds the new snapshot.
-	previous, hadPrevious := loadSnapshotState()
-	if err := saveSnapshotState(volume, createdName); err != nil {
-		// Persistence failed but the snapshot itself exists. Best effort:
-		// leave both snapshots in place. Boot restore will keep using
-		// the previous snapshot (still pointed to by snapshot.json),
-		// while the new snapshot becomes a harmless orphan that the
-		// next successful freeze cycle will clean up.
-		_ = deleteAPFSSnapshot(volume, createdName)
-		return "", fmt.Errorf("snapshot created but state save failed (snapshot rolled back): %w", err)
-	}
-
-	// State successfully points at the new snapshot. Now reap the old
-	// one to reclaim space. A failure here is harmless — the orphan
-	// just consumes APFS COW overhead until the next freeze.
-	if hadPrevious && previous.Name != "" && previous.Name != createdName {
-		_ = deleteAPFSSnapshot(volume, previous.Name)
-	}
-
-	return createdName, nil
+func isVolumeNotReady(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "-69854")
 }
 
 // deviceForVolume returns the /dev/diskXsY path for the given volume mount path.
@@ -366,12 +231,228 @@ func deviceForVolume(volume string) (string, error) {
 	return "", fmt.Errorf("device identifier not found for %s", volume)
 }
 
-// isTransientMountError detects errors that mount_apfs may emit during
-// the boot window when APFS is still settling — same family as the
-// listSnapshots -69854 race. Time Machine creating its own hourly
-// snapshot at the same instant can also briefly hold a lock that
-// makes mount_apfs return "Resource busy". These are worth retrying;
-// "snapshot not found" or "permission denied" are not.
+// ── Snapshot enumeration ──────────────────────────────────────────────────────
+
+func listAPFSSnapshotNames(volume string) ([]string, error) {
+	out, err := runDiskutil("apfs", "listSnapshots", volume)
+	if err != nil {
+		return nil, err
+	}
+	return parseSnapshotNames(out), nil
+}
+
+// parseSnapshotNames extracts snapshot names from `diskutil apfs
+// listSnapshots` output. The format on Sequoia is the tree-style
+// listing where each snapshot has a "Name:" line. We accept both
+// "Name:" and "Snapshot Name:" because older diskutil versions used
+// the longer form and we don't want to flake on a future variant.
+func parseSnapshotNames(out string) []string {
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "Snapshot Name:"):
+			n := strings.TrimSpace(strings.TrimPrefix(line, "Snapshot Name:"))
+			if n != "" {
+				names = append(names, n)
+			}
+		case strings.HasPrefix(line, "Name:"):
+			n := strings.TrimSpace(strings.TrimPrefix(line, "Name:"))
+			if n != "" {
+				names = append(names, n)
+			}
+		}
+	}
+	return names
+}
+
+// listSnapshotsWithRetry wraps the diskutil call with the -69854 retry
+// loop. The retry only triggers on the specific transient error; any
+// other error is returned immediately.
+func listSnapshotsWithRetry(log *nivlog.Logger, volume string) ([]string, error) {
+	var names []string
+	var err error
+	for attempt := 0; attempt < listSnapshotRetries; attempt++ {
+		names, err = listAPFSSnapshotNames(volume)
+		if err == nil {
+			return names, nil
+		}
+		if !isVolumeNotReady(err) {
+			return nil, err
+		}
+		if log != nil {
+			log.Warn("snapshot.list.retry", "attempt", attempt+1, "error", err.Error())
+		}
+		time.Sleep(listSnapshotDelay)
+	}
+	return nil, err
+}
+
+func deleteAPFSSnapshot(volume, name string) error {
+	_, err := runDiskutil("apfs", "deleteSnapshot", volume, "-name", name)
+	return err
+}
+
+// ── Preflight ────────────────────────────────────────────────────────────────
+
+// SnapshotPreflight verifies the volume is APFS, present, and
+// (optionally) contains the named snapshot. Used by both the boot
+// restore (with requireSnapshot=true) and the freeze flow (with
+// requireSnapshot=false, since the snapshot doesn't exist yet).
+func SnapshotPreflight(log *nivlog.Logger, volume, name string, requireSnapshot bool) error {
+	if _, err := exec.LookPath("diskutil"); err != nil {
+		return fmt.Errorf("diskutil not found: %w", err)
+	}
+	if strings.TrimSpace(volume) == "" {
+		return fmt.Errorf("snapshot volume is empty")
+	}
+	if _, err := os.Stat(volume); err != nil {
+		return fmt.Errorf("snapshot volume not found: %s: %w", volume, err)
+	}
+	info, err := runDiskutil("info", volume)
+	if err != nil {
+		return err
+	}
+	if !isAPFSInfo(info) {
+		return fmt.Errorf("snapshot volume is not APFS: %s", strings.TrimSpace(info))
+	}
+	names, err := listSnapshotsWithRetry(log, volume)
+	if err != nil {
+		return err
+	}
+	if requireSnapshot {
+		for _, existing := range names {
+			if existing == name {
+				return nil
+			}
+		}
+		return fmt.Errorf("snapshot %q not found on %s (available: %v)\n"+
+			"  hint: snapshot may have been deleted by Time Machine pruning, "+
+			"a macOS update, or storage pressure — run 'sudo niveniactl freeze' "+
+			"to capture a new baseline", name, volume, names)
+	}
+	return nil
+}
+
+// ── Snapshot creation (freeze) ───────────────────────────────────────────────
+
+// CaptureBaseline creates a fresh APFS snapshot via tmutil, persists
+// its name to snapshot.json, then deletes the previous baseline.
+//
+// Atomic-swap rollback semantics:
+//   - On success of all steps: snapshot.json points to the new
+//     snapshot; the old one is deleted; system is fully migrated.
+//   - On tmutil failure: nothing changed, error returned.
+//   - On state-save failure: we attempt to delete the new snapshot
+//     and return an error; the old snapshot remains live.
+//   - On old-snapshot-delete failure: ignored. The new snapshot is
+//     active; the old becomes a harmless orphan that next freeze
+//     will clean up.
+//
+// At no point do we delete the old snapshot before the new one is
+// confirmed to exist AND tracked in snapshot.json.
+func CaptureBaseline(log *nivlog.Logger, managedRoot string) error {
+	volume := SnapshotVolume(managedRoot)
+
+	if err := SnapshotPreflight(log, volume, "", false); err != nil {
+		return err
+	}
+
+	if log != nil {
+		log.Info("freeze.start", "volume", volume)
+	}
+
+	// Take the snapshot. tmutil prints the date on success which we
+	// use to derive the snapshot name (com.apple.TimeMachine.<date>.local).
+	out, err := runTmutil("localsnapshot")
+	if err != nil {
+		if log != nil {
+			log.Error("freeze.tmutil.fail", "error", err.Error(), "out", strings.TrimSpace(out))
+		}
+		return fmt.Errorf("tmutil localsnapshot: %w", err)
+	}
+
+	match := snapshotDateRegex.FindStringSubmatch(out)
+	if len(match) < 2 {
+		// Output didn't follow the expected format. Fall back to
+		// listing — find any newly-appeared TM snapshot (best effort)
+		// before returning the error so the admin has context.
+		names, _ := listAPFSSnapshotNames(volume)
+		if log != nil {
+			log.Error("freeze.parse.fail", "tmutil_out", strings.TrimSpace(out), "snapshots", strings.Join(names, ","))
+		}
+		return fmt.Errorf("could not parse tmutil output: %q", strings.TrimSpace(out))
+	}
+	newName := tmSnapshotPrefix + match[1] + tmSnapshotSuffix
+
+	// Verify the snapshot is visible before saving state. There's a
+	// brief window where listSnapshots may not yet include the new one.
+	visible := false
+	for attempt := 0; attempt < 5; attempt++ {
+		names, err := listAPFSSnapshotNames(volume)
+		if err == nil {
+			for _, n := range names {
+				if n == newName {
+					visible = true
+					break
+				}
+			}
+		}
+		if visible {
+			break
+		}
+		time.Sleep(time.Second)
+	}
+	if !visible {
+		if log != nil {
+			log.Error("freeze.verify.fail", "expected", newName)
+		}
+		return fmt.Errorf("created snapshot %q not visible in listSnapshots", newName)
+	}
+
+	if log != nil {
+		log.Info("freeze.snapshot.created", "name", newName)
+	}
+
+	// Capture the previous baseline name BEFORE saving the new state
+	// (saveSnapshotState will overwrite snapshot.json).
+	previous, hadPrevious := loadSnapshotState()
+
+	if err := saveSnapshotState(volume, newName); err != nil {
+		// Rollback: delete the snapshot we just made so we don't
+		// leak it. The old snapshot is still pointed to by the
+		// previous (now-unchanged) snapshot.json.
+		_ = deleteAPFSSnapshot(volume, newName)
+		if log != nil {
+			log.Error("freeze.state.save.fail", "error", err.Error())
+		}
+		return fmt.Errorf("save snapshot state: %w (rolled back)", err)
+	}
+
+	// State successfully points at the new snapshot. Reap the old
+	// baseline, but ONLY if it's a Nivenia/TM snapshot we tracked —
+	// never delete an arbitrary user snapshot.
+	if hadPrevious && previous.Name != "" && previous.Name != newName {
+		if err := deleteAPFSSnapshot(volume, previous.Name); err != nil {
+			if log != nil {
+				log.Warn("freeze.old.delete.fail", "name", previous.Name, "error", err.Error())
+			}
+		} else if log != nil {
+			log.Info("freeze.old.deleted", "name", previous.Name)
+		}
+	}
+
+	if log != nil {
+		log.Info("freeze.complete", "snapshot", newName)
+	}
+	return nil
+}
+
+// ── Mount snapshot ────────────────────────────────────────────────────────────
+
+// isTransientMountError detects errors mount_apfs may emit during the
+// boot window when APFS is still settling, or when Time Machine is
+// taking a snapshot at the same time.
 func isTransientMountError(err error) bool {
 	if err == nil {
 		return false
@@ -384,12 +465,11 @@ func isTransientMountError(err error) bool {
 }
 
 // mountSnapshotAt mounts a named APFS snapshot read-only at mountPoint.
-// nobrowse hides it from Finder. mount_apfs is available on all macOS
-// with APFS (10.12+). Retries on transient errors that occur during the
-// fast-boot window.
-func mountSnapshotAt(device, snapshotName, mountPoint string) error {
+// nobrowse hides it from Finder. Retries on transient errors that
+// occur during the fast-boot window.
+func mountSnapshotAt(log *nivlog.Logger, device, snapshotName, mountPoint string) error {
 	var lastErr error
-	for attempt := 0; attempt < 6; attempt++ {
+	for attempt := 0; attempt < mountSnapshotRetries; attempt++ {
 		cmd := exec.Command("mount_apfs", "-o", "nobrowse", "-s", snapshotName, device, mountPoint)
 		out, err := cmd.CombinedOutput()
 		if err == nil {
@@ -399,158 +479,249 @@ func mountSnapshotAt(device, snapshotName, mountPoint string) error {
 		if !isTransientMountError(lastErr) {
 			return lastErr
 		}
-		// Linear back-off — the longest wait we tolerate is ~1 minute,
-		// well within the launchd-managed boot timeout.
-		time.Sleep(10 * time.Second)
+		if log != nil {
+			log.Warn("snapshot.mount.retry", "attempt", attempt+1, "error", lastErr.Error())
+		}
+		time.Sleep(mountSnapshotDelay)
 	}
 	return lastErr
 }
 
-// rsyncRestore syncs src into dst, deleting files in dst that are absent in src.
-// rsync exit 23 (partial transfer, e.g. hard-link errors) and 24 (vanished source
-// files) are treated as non-fatal. ctx cancellation kills the rsync subprocess.
-// Returns a short stats summary ("N files transferred").
+// ── rsync ─────────────────────────────────────────────────────────────────────
+
+// rsyncErrorLineRE matches an openrsync error line:
 //
-// Flags:
+//	rsync(12345): error: <details>
+//	rsync: error: <details>
+//	rsync: <details>: ENOENT (...) (only when accompanied by other error markers)
 //
-//	-a   archive: recursive + symlinks + perms + times + group/owner + devices
-//	-H   preserve hard links
-//	-E   preserve extended attributes (Apple-patched rsync 2.6.9 — this is the
-//	     flag that, on macOS, copies xattrs *and* ACLs *and* resource forks,
-//	     rolled into one. Without -E, the restored files lose the
-//	     com.apple.quarantine xattr (so Gatekeeper would re-prompt for any
-//	     downloaded .dmg/.pkg in the snapshot), Finder tags, custom icons,
-//	     and any access-control entries set with `chmod +a`. Apple maps -E
-//	     to whatever the supported metadata is for the destination FS, so
-//	     APFS→APFS round-trips are lossless.)
-func rsyncRestore(ctx context.Context, src, dst string) (string, error) {
-	srcDir := strings.TrimRight(src, "/") + "/"
-	dstDir := strings.TrimRight(dst, "/") + "/"
-	// .Spotlight-V100 and CoreSpotlight use cross-directory hard links that
-	// rsync -H cannot replicate atomically (exit 23). Both are regenerated by
-	// Spotlight on boot, so excluding them is safe and eliminates the noise.
-	var summary string
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		cmd := exec.CommandContext(ctx, "rsync", "-aHE", "--delete", "--force", "--stats",
-			"--exclude=.Spotlight-V100",
-			"--exclude=.fseventsd",
-			"--exclude=CoreSpotlight",
-			srcDir, dstDir)
-		out, err := cmd.CombinedOutput()
-		summary = parseRsyncStats(string(out))
-		if err == nil {
-			return summary, nil
-		}
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			switch exitErr.ExitCode() {
-			case 20, 23, 24:
-				// 20 = transfer interrupted by signal
-				// 23 = partial transfer (e.g. cross-directory hard links in system metadata)
-				// 24 = source files vanished mid-transfer
-				return summary, nil
-			}
-		}
-		lastErr = fmt.Errorf("rsync %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
-		if ctx.Err() != nil || attempt == 2 || !isRetryableRsyncError(lastErr) {
-			return summary, lastErr
-		}
-		// Retry once or twice for transient source-read failures. The source
-		// is a mounted snapshot, so a second pass is safe and often enough to
-		// get past a transient EOF from rsync's file reading path.
-		time.Sleep(time.Duration(attempt+1) * time.Second)
-	}
-	return summary, lastErr
+// We deliberately keep this strict — a literal "error:" token in the
+// output is openrsync's documented signal of a real failure.
+var rsyncErrorLineRE = regexp.MustCompile(`(?m)^rsync(?:\([0-9]+\))?:\s*error:`)
+
+// hasRsyncErrors scans rsync stderr for openrsync's "error:" markers.
+// This is the only reliable failure signal under openrsync's exit-0-
+// with-errors bug; we use it in addition to the exit code, never
+// instead of it.
+func hasRsyncErrors(stderr string) bool {
+	return rsyncErrorLineRE.MatchString(stderr)
 }
 
-func restoreApplicationsFallback(ctx context.Context, src, dst string) error {
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	if err := os.RemoveAll(dst); err != nil {
-		return fmt.Errorf("remove %s before fallback restore: %w", dst, err)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return fmt.Errorf("recreate parent for %s: %w", dst, err)
-	}
-	cmd := exec.CommandContext(ctx, "ditto", src, dst)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
-	}
-	return nil
+// rsyncResult is the parsed outcome of one rsync invocation. We carry
+// stdout AND stderr separately because openrsync's error reporting
+// goes through stderr and was being lost when we used CombinedOutput.
+type rsyncResult struct {
+	exitCode  int    // -1 if cmd.Run errored without producing one
+	stdout    string // captured stdout (rsync stats, file list)
+	stderr    string // captured stderr (errors, warnings)
+	statsLine string // pre-parsed "Number of regular files transferred: N" line
+	cmdline   string // rendered command for the log
 }
 
-func isRetryableRsyncError(err error) bool {
+// runRsync executes rsync with the given arguments and captures stdout
+// and stderr separately. It returns the result struct unconditionally;
+// the caller decides whether to treat the run as success or failure.
+func runRsync(ctx context.Context, args []string) rsyncResult {
+	cmd := exec.CommandContext(ctx, "rsync", args...)
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+
+	res := rsyncResult{
+		stdout:  outBuf.String(),
+		stderr:  errBuf.String(),
+		cmdline: "rsync " + strings.Join(args, " "),
+	}
+	res.statsLine = parseRsyncStats(res.stdout)
+
 	if err == nil {
-		return false
+		res.exitCode = 0
+		return res
 	}
-	text := strings.ToLower(err.Error())
-	return strings.Contains(text, "unexpected end of file") ||
-		strings.Contains(text, "unexpected eof") ||
-		strings.Contains(text, "broken pipe") ||
-		strings.Contains(text, "connection unexpectedly closed") ||
-		strings.Contains(text, "exit status 20")
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		res.exitCode = exitErr.ExitCode()
+		return res
+	}
+	// Couldn't even start rsync, or context cancellation killed it.
+	res.exitCode = -1
+	if ctx.Err() != nil {
+		res.stderr = strings.TrimRight(res.stderr, "\n") + "\nrsync: cancelled by context: " + ctx.Err().Error()
+	} else {
+		res.stderr = strings.TrimRight(res.stderr, "\n") + "\nrsync: " + err.Error()
+	}
+	return res
 }
 
+// parseRsyncStats picks the "files transferred" stats line out of
+// rsync's --stats output. Apple's classic rsync 2.6.9 wrote
+//
+//	Number of regular files transferred: 683
+//
+// Sequoia's openrsync writes
+//
+//	Number of files transferred: 0
+//
+// We accept either form so the same code works through any future
+// switch. The line is reported verbatim to the structured log so
+// admins can see whether a restore actually moved anything (a busy
+// /Applications restore should always be > 0; a tight rerun is 0).
 func parseRsyncStats(out string) string {
 	for _, line := range strings.Split(out, "\n") {
 		t := strings.TrimSpace(line)
 		if strings.HasPrefix(t, "Number of regular files transferred:") {
 			return t
 		}
+		if strings.HasPrefix(t, "Number of files transferred:") {
+			return t
+		}
 	}
 	return ""
 }
 
-// CaptureBaseline creates a fresh APFS snapshot of the managed volume
-// and persists its name. State is updated by createAPFSSnapshot itself
-// as part of the atomic swap; on failure the previous baseline (if any)
-// is left untouched so boot restore continues to work.
-func CaptureBaseline(managedRoot string) error {
-	volume := SnapshotVolume(managedRoot)
-	_, err := createAPFSSnapshot(volume, freshSnapshotName())
-	return err
+// rsyncRestore syncs src into dst, deleting files in dst that are
+// absent from src. Flags chosen for Sequoia/openrsync compatibility:
+//
+//	-a   archive (recursive, perms, times, owner, group, symlinks)
+//	-H   preserve hard links
+//	     (no -E: see file-level comment for the openrsync bug it triggers)
+//
+// Returns a short summary on success. On failure, returns an error
+// whose message includes the exit code, the cmdline, and a reference
+// to the per-run stderr file (written by the caller via WriteDetail).
+func rsyncRestore(ctx context.Context, log *nivlog.Logger, src, dst string) (string, error) {
+	srcDir := strings.TrimRight(src, "/") + "/"
+	dstDir := strings.TrimRight(dst, "/") + "/"
+
+	args := []string{
+		"-aH",
+		"--delete",
+		"--stats",
+		// Spotlight metadata uses cross-directory hardlinks rsync
+		// can't replicate cleanly. Spotlight rebuilds them on boot.
+		"--exclude=.Spotlight-V100",
+		"--exclude=.fseventsd",
+		"--exclude=CoreSpotlight",
+		// AppleDouble shadow files (._foo). On APFS these are
+		// virtual and rsync's enumeration of them has historically
+		// produced spurious openat ENOENT errors. We don't need
+		// them since we don't request -E.
+		"--exclude=._*",
+		srcDir, dstDir,
+	}
+
+	res := runRsync(ctx, args)
+
+	// Write the full rsync transcript to a per-run detail file
+	// regardless of outcome, so the admin always has the trail.
+	detailPath := ""
+	if log != nil {
+		body := fmt.Sprintf("# %s\n# exit=%d\n# === stdout ===\n%s\n# === stderr ===\n%s",
+			res.cmdline, res.exitCode, res.stdout, res.stderr)
+		detailPath = log.WriteDetail("rsync-"+filepath.Base(dstDir), body)
+	}
+
+	if res.exitCode == 0 && !hasRsyncErrors(res.stderr) {
+		if log != nil {
+			log.Info("rsync.ok",
+				"src", srcDir,
+				"dst", dstDir,
+				"stats", res.statsLine,
+				"detail", detailPath,
+			)
+		}
+		return res.statsLine, nil
+	}
+
+	// Failure path. Build an error message that's both grep-friendly
+	// in the main log AND points to the detail file for the full
+	// transcript. We deliberately do NOT silently treat any non-zero
+	// exit as success — that hid the openrsync corruption that was
+	// shipping half-restores.
+	stderrSnippet := firstNonEmptyLines(res.stderr, 5)
+	if log != nil {
+		log.Error("rsync.fail",
+			"src", srcDir,
+			"dst", dstDir,
+			"exit", res.exitCode,
+			"stderr_summary", stderrSnippet,
+			"detail", detailPath,
+		)
+	}
+	return res.statsLine, fmt.Errorf("rsync %s -> %s: exit=%d (detail=%s) stderr: %s",
+		srcDir, dstDir, res.exitCode, detailPath, stderrSnippet)
 }
 
-// RestoreFromBaseline mounts the frozen snapshot read-only and rsyncs each
-// path in restorePaths from the snapshot back to the live volume.
-// This works on all macOS versions (Monterey–Sequoia) without private entitlements.
-// ctx cancellation (e.g. SIGTERM) is propagated to the rsync subprocess so it
-// is killed before the caller exits, preventing orphaned rsyncs after daemon stop.
-func RestoreFromBaseline(ctx context.Context, managedRoot string, restorePaths []string) error {
+func firstNonEmptyLines(s string, n int) string {
+	var picked []string
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		picked = append(picked, line)
+		if len(picked) >= n {
+			break
+		}
+	}
+	if len(picked) == 0 {
+		return ""
+	}
+	return strings.Join(picked, " | ")
+}
+
+// ── Boot restore ──────────────────────────────────────────────────────────────
+
+// RestoreFromBaseline mounts the saved snapshot read-only and rsyncs
+// each restorePath from snapshot to live. ctx cancellation kills the
+// in-flight rsync (so a SIGTERM to niveniad doesn't leave orphans).
+func RestoreFromBaseline(ctx context.Context, log *nivlog.Logger, managedRoot string, restorePaths []string) error {
 	volume := SnapshotVolume(managedRoot)
 	name := SnapshotName()
+	if log != nil {
+		log.Info("restore.preflight.start", "volume", volume, "snapshot", name)
+	}
 
-	fmt.Fprintf(os.Stderr, "[restore] snapshot: %s\n", name)
-
-	if err := snapshotPreflight(volume, name, true); err != nil {
+	if err := SnapshotPreflight(log, volume, name, true); err != nil {
+		if log != nil {
+			log.Error("restore.preflight.fail", "error", err.Error())
+		}
 		return err
 	}
 
 	device, err := deviceForVolume(volume)
 	if err != nil {
+		if log != nil {
+			log.Error("restore.device.fail", "error", err.Error())
+		}
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[restore] device: %s\n", device)
 
 	mountPoint, err := os.MkdirTemp("", "nivenia-snap-*")
 	if err != nil {
 		return fmt.Errorf("create mount point: %w", err)
 	}
 	defer func() {
-		if err := exec.Command("diskutil", "unmount", mountPoint).Run(); err != nil {
-			// Force-unmount so a dangling snapshot never blocks the next boot restore.
+		// Try clean unmount; force-unmount as a fallback so a
+		// dangling snapshot mount can never block the next boot.
+		if uErr := exec.Command("diskutil", "unmount", mountPoint).Run(); uErr != nil {
 			_ = exec.Command("diskutil", "unmount", "force", mountPoint).Run()
 		}
 		_ = os.Remove(mountPoint)
 	}()
 
-	fmt.Fprintf(os.Stderr, "[restore] mounting snapshot...\n")
-	if err := mountSnapshotAt(device, name, mountPoint); err != nil {
+	if log != nil {
+		log.Info("restore.mount.start", "device", device, "snapshot", name, "mountpoint", mountPoint)
+	}
+	if err := mountSnapshotAt(log, device, name, mountPoint); err != nil {
+		if log != nil {
+			log.Error("restore.mount.fail", "error", err.Error())
+		}
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "[restore] mounted at %s\n", mountPoint)
+	if log != nil {
+		log.Info("restore.mount.ok", "mountpoint", mountPoint)
+	}
 
 	start := time.Now()
 	for _, targetPath := range restorePaths {
@@ -563,32 +734,38 @@ func RestoreFromBaseline(ctx context.Context, managedRoot string, restorePaths [
 		}
 		srcPath := filepath.Join(mountPoint, rel)
 		if _, err := os.Stat(srcPath); err != nil {
-			fmt.Fprintf(os.Stderr, "[restore] WARN: path not in snapshot, skipping: %s\n", targetPath)
+			if log != nil {
+				log.Warn("restore.path.absent", "path", targetPath, "stat_error", err.Error())
+			}
 			continue
 		}
+
+		if log != nil {
+			log.Info("rsync.start", "src", srcPath, "dst", targetPath)
+		}
 		t0 := time.Now()
-		fmt.Fprintf(os.Stderr, "[restore] syncing %s...\n", targetPath)
-		stats, err := rsyncRestore(ctx, srcPath, targetPath)
+		stats, err := rsyncRestore(ctx, log, srcPath, targetPath)
+		elapsed := time.Since(t0).Round(time.Millisecond)
 		if err != nil {
-			if pathpkg.Clean(targetPath) == "/System/Volumes/Data/Applications" && isRetryableRsyncError(err) {
-				fmt.Fprintf(os.Stderr, "[restore] rsync failed for %s; retrying with ditto fallback\n", targetPath)
-				if fallbackErr := restoreApplicationsFallback(ctx, srcPath, targetPath); fallbackErr == nil {
-					fmt.Fprintf(os.Stderr, "[restore] fallback restore for %s completed\n", targetPath)
-					continue
-				} else {
-					return fallbackErr
-				}
+			if log != nil {
+				log.Error("restore.path.fail",
+					"path", targetPath,
+					"elapsed", elapsed.String(),
+					"error", err.Error(),
+				)
 			}
 			return err
 		}
-		elapsed := time.Since(t0).Round(time.Millisecond)
-		if stats != "" {
-			fmt.Fprintf(os.Stderr, "[restore] done %s in %s (%s)\n", targetPath, elapsed, stats)
-		} else {
-			fmt.Fprintf(os.Stderr, "[restore] done %s in %s\n", targetPath, elapsed)
+		if log != nil {
+			log.Info("restore.path.ok",
+				"path", targetPath,
+				"elapsed", elapsed.String(),
+				"stats", stats,
+			)
 		}
 	}
-	fmt.Fprintf(os.Stderr, "[restore] completed in %s\n", time.Since(start).Round(time.Millisecond))
-
+	if log != nil {
+		log.Info("restore.complete", "elapsed", time.Since(start).Round(time.Millisecond).String())
+	}
 	return nil
 }

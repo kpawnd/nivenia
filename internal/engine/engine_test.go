@@ -11,8 +11,18 @@ import (
 	"testing"
 
 	"nivenia/internal/config"
+	"nivenia/internal/nivlog"
 	"nivenia/internal/state"
 )
+
+// adaptRestoreFn wraps the legacy 3-arg test-helper closure into the
+// 4-arg engine signature. Tests stay terse (they don't care about the
+// log argument) while production code gets the logger threaded through.
+func adaptRestoreFn(fn func(ctx context.Context, managedRoot string, restorePaths []string) error) func(ctx context.Context, log *nivlog.Logger, managedRoot string, restorePaths []string) error {
+	return func(ctx context.Context, _ *nivlog.Logger, managedRoot string, restorePaths []string) error {
+		return fn(ctx, managedRoot, restorePaths)
+	}
+}
 
 // newTestEngine creates an Engine pointing entirely at a temp directory so
 // tests never touch /var/lib or /var/log.
@@ -39,7 +49,7 @@ func newTestEngine(
 			StateFile:    stateFile,
 			LogFile:      logFile,
 		},
-		RestoreFn: restoreFn,
+		RestoreFn: adaptRestoreFn(restoreFn),
 		// Tests don't have a real integrity record or APFS volume; bypass
 		// the snapshot verification that production engines run before
 		// rsync. The default (integrity.VerifySnapshotOnly) would hit
@@ -151,11 +161,15 @@ func TestRunBootRestore_Frozen_FailureCountAccumulates(t *testing.T) {
 	}
 }
 
-// After max consecutive failures, the daemon must stop trying — otherwise
-// every boot keeps churning rsync against a dead snapshot and writing
-// failure messages forever (the bug that motivated this test). The next
-// boot after exceeding the threshold should auto-thaw and return success
-// so launchd doesn't keep retrying.
+// After max consecutive failures, the daemon must stop trying —
+// otherwise every boot keeps churning rsync against a dead snapshot
+// and writing failure messages forever (the bug that motivated this
+// test).
+//
+// With max=3, the boot timeline is: fail, fail, fail, auto-thaw. The
+// third failed boot leaves FailureCount at exactly max; the next boot
+// trips the >= guard and skips straight to auto-thaw without
+// attempting another restore.
 func TestRunBootRestore_AutoThawsAfterThreshold(t *testing.T) {
 	callCount := 0
 	e := newTestEngine(t, state.ModeFrozen, func(_ context.Context, _ string, _ []string) error {
@@ -163,13 +177,13 @@ func TestRunBootRestore_AutoThawsAfterThreshold(t *testing.T) {
 		return errors.New("snapshot disappeared")
 	})
 
-	// Drive failure count up to and past the threshold.
-	for i := 0; i < maxConsecutiveRestoreFailures+1; i++ {
+	// Three failures bring FailureCount up to the threshold.
+	for i := 0; i < maxConsecutiveRestoreFailures; i++ {
 		_ = e.RunBootRestore(context.Background())
 	}
 	s := loadState(t, e)
-	if s.FailureCount != maxConsecutiveRestoreFailures+1 {
-		t.Fatalf("setup: expected FailureCount=%d, got %d", maxConsecutiveRestoreFailures+1, s.FailureCount)
+	if s.FailureCount != maxConsecutiveRestoreFailures {
+		t.Fatalf("setup: expected FailureCount=%d, got %d", maxConsecutiveRestoreFailures, s.FailureCount)
 	}
 	if s.Mode != state.ModeFrozen {
 		t.Fatalf("setup: still expected frozen before auto-thaw boot, got %q", s.Mode)
@@ -249,6 +263,12 @@ func TestRunBootRestore_ThawOnce_SkipsAndSetsFrozen(t *testing.T) {
 
 // ── Log ───────────────────────────────────────────────────────────────────────
 
+// The structured log must record the lifecycle: at minimum, the boot
+// must START (event=boot.start), the snapshot must be VERIFIED
+// (event=verify.ok), and the boot must END (event=boot.done). Each
+// event is one line, prefixed with timestamp + level + session ID.
+// Tests downstream of triage use these event names — never change a
+// name without searching for callers.
 func TestRunBootRestore_LogsEvents(t *testing.T) {
 	e := newTestEngine(t, state.ModeFrozen, func(_ context.Context, _ string, _ []string) error {
 		return nil
@@ -261,11 +281,10 @@ func TestRunBootRestore_LogsEvents(t *testing.T) {
 		t.Fatalf("read log: %v", err)
 	}
 	log := string(data)
-	if !strings.Contains(log, "restore started") {
-		t.Error("log should contain 'restore started'")
-	}
-	if !strings.Contains(log, "restore completed") {
-		t.Error("log should contain 'restore completed'")
+	for _, want := range []string{"event=boot.start", "event=verify.ok", "event=boot.done"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log should contain %q\n--- log ---\n%s", want, log)
+		}
 	}
 }
 
@@ -320,7 +339,7 @@ func TestRunBootRestore_StaleLockFromDeadPID_IsCleared(t *testing.T) {
 			StateFile:    stateFile,
 			LogFile:      logFile,
 		},
-		RestoreFn: func(_ context.Context, _ string, _ []string) error {
+		RestoreFn: func(_ context.Context, _ *nivlog.Logger, _ string, _ []string) error {
 			called = true
 			return nil
 		},
@@ -361,7 +380,7 @@ func TestRunBootRestore_ActiveLock_SkipsRestore(t *testing.T) {
 			StateFile:    stateFile,
 			LogFile:      logFile,
 		},
-		RestoreFn: func(_ context.Context, _ string, _ []string) error {
+		RestoreFn: func(_ context.Context, _ *nivlog.Logger, _ string, _ []string) error {
 			called = true
 			return nil
 		},
