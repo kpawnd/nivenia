@@ -22,8 +22,8 @@ const (
 	// dance had to delete first (because APFS rejects duplicate names),
 	// which left a window where a transient create failure orphaned the
 	// machine with NO baseline.
-	snapshotNamePrefix  = "nivenia-"
-	snapshotStatePath   = "/var/lib/nivenia/snapshot.json"
+	snapshotNamePrefix = "nivenia-"
+	snapshotStatePath  = "/var/lib/nivenia/snapshot.json"
 	// snapshotTimestampLayout matches Go's reference time. The format is
 	// "20060102T150405Z" — basic ISO 8601, UTC. Letters are alphanumeric
 	// and the "Z" suffix is unambiguous, so the resulting name is safe
@@ -227,18 +227,66 @@ func deleteAPFSSnapshot(volume, name string) error {
 	return err
 }
 
+func runTmutil(args ...string) (string, error) {
+	cmd := exec.Command("tmutil", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("tmutil %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return string(out), nil
+}
+
+func isUnsupportedAPFSSnapshotVerb(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "did not recognize apfs verb \"snapshot\"") || strings.Contains(text, "verb \"snapshot\" is not recognized")
+}
+
+func snapshotNameSet(names []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		set[name] = struct{}{}
+	}
+	return set
+}
+
+func diffSnapshotNames(before, after []string) []string {
+	seen := snapshotNameSet(before)
+	var created []string
+	for _, name := range after {
+		if _, ok := seen[name]; !ok {
+			created = append(created, name)
+		}
+	}
+	return created
+}
+
+func createAPFSSnapshotWithTmutil(volume string, beforeNames []string) (string, error) {
+	if _, err := runTmutil("localsnapshot"); err != nil {
+		return "", err
+	}
+	afterNames, err := listAPFSSnapshotNames(volume)
+	if err != nil {
+		return "", err
+	}
+	created := diffSnapshotNames(beforeNames, afterNames)
+	if len(created) != 1 {
+		return "", fmt.Errorf("could not identify created snapshot on %s (before=%v after=%v)", volume, beforeNames, afterNames)
+	}
+	return created[0], nil
+}
+
 // createAPFSSnapshot performs an atomic-swap freeze: it creates a new
 // snapshot under a unique name, persists the new name to snapshot.json,
 // and only then deletes the previous baseline. If any step fails, the
 // previous baseline remains live and intact — the machine is never left
 // without a working restore point.
 //
-// We do NOT fall back to tmutil. Time Machine local snapshots are
-// auto-pruned by macOS within ~24 hours, so a tmutil baseline silently
-// disappears overnight. `diskutil apfs snapshot` is supported on every
-// macOS version we target (Monterey 12 through Sequoia 15). If it is
-// reported as unsupported here, that is a real failure to surface, not
-// a fallback opportunity.
+// Some macOS builds do not expose a diskutil APFS snapshot-creation verb.
+// In that case we fall back to tmutil localsnapshot and record the actual
+// snapshot name that was created.
 func createAPFSSnapshot(volume, newName string) (string, error) {
 	if newName == "" {
 		return "", fmt.Errorf("snapshot name is empty")
@@ -247,23 +295,30 @@ func createAPFSSnapshot(volume, newName string) (string, error) {
 		return "", err
 	}
 
-	// freshSnapshotName guarantees uniqueness via timestamp, so this name
-	// should never collide. If it somehow does (env override, clock skew),
-	// fail loudly rather than silently overwriting an existing snapshot.
-	if names, err := listAPFSSnapshotNames(volume); err == nil {
-		for _, n := range names {
-			if n == newName {
-				return "", fmt.Errorf("snapshot %q already exists; refusing to overwrite (manual cleanup required)", newName)
-			}
-		}
+	beforeNames, err := listAPFSSnapshotNames(volume)
+	if err != nil {
+		return "", err
 	}
 
+	createdName := newName
 	if _, err := runDiskutil("apfs", "snapshot", volume, "-name", newName); err != nil {
-		// On supported macOS, the snapshot verb is always available. The
-		// only legitimate failures here are environmental (volume gone,
-		// disk pressure, kernel APFS error) and they should bubble up
-		// untouched so callers can surface the real cause.
-		return "", err
+		if !isUnsupportedAPFSSnapshotVerb(err) {
+			return "", err
+		}
+		createdName, err = createAPFSSnapshotWithTmutil(volume, beforeNames)
+		if err != nil {
+			return "", err
+		}
+	} else {
+		afterNames, err := listAPFSSnapshotNames(volume)
+		if err != nil {
+			return "", err
+		}
+		created := diffSnapshotNames(beforeNames, afterNames)
+		if len(created) != 1 {
+			return "", fmt.Errorf("could not identify created snapshot on %s (before=%v after=%v)", volume, beforeNames, afterNames)
+		}
+		createdName = created[0]
 	}
 
 	// Snapshot create succeeded. Update snapshot.json with the new name
@@ -272,24 +327,24 @@ func createAPFSSnapshot(volume, newName string) (string, error) {
 	// is then orphaned but harmless). Boot restore reads the new name
 	// and finds the new snapshot.
 	previous, hadPrevious := loadSnapshotState()
-	if err := saveSnapshotState(volume, newName); err != nil {
+	if err := saveSnapshotState(volume, createdName); err != nil {
 		// Persistence failed but the snapshot itself exists. Best effort:
 		// leave both snapshots in place. Boot restore will keep using
 		// the previous snapshot (still pointed to by snapshot.json),
 		// while the new snapshot becomes a harmless orphan that the
 		// next successful freeze cycle will clean up.
-		_ = deleteAPFSSnapshot(volume, newName)
+		_ = deleteAPFSSnapshot(volume, createdName)
 		return "", fmt.Errorf("snapshot created but state save failed (snapshot rolled back): %w", err)
 	}
 
 	// State successfully points at the new snapshot. Now reap the old
 	// one to reclaim space. A failure here is harmless — the orphan
 	// just consumes APFS COW overhead until the next freeze.
-	if hadPrevious && previous.Name != "" && previous.Name != newName {
+	if hadPrevious && previous.Name != "" && previous.Name != createdName {
 		_ = deleteAPFSSnapshot(volume, previous.Name)
 	}
 
-	return newName, nil
+	return createdName, nil
 }
 
 // deviceForVolume returns the /dev/diskXsY path for the given volume mount path.
@@ -356,16 +411,17 @@ func mountSnapshotAt(device, snapshotName, mountPoint string) error {
 // Returns a short stats summary ("N files transferred").
 //
 // Flags:
-//   -a   archive: recursive + symlinks + perms + times + group/owner + devices
-//   -H   preserve hard links
-//   -E   preserve extended attributes (Apple-patched rsync 2.6.9 — this is the
-//        flag that, on macOS, copies xattrs *and* ACLs *and* resource forks,
-//        rolled into one. Without -E, the restored files lose the
-//        com.apple.quarantine xattr (so Gatekeeper would re-prompt for any
-//        downloaded .dmg/.pkg in the snapshot), Finder tags, custom icons,
-//        and any access-control entries set with `chmod +a`. Apple maps -E
-//        to whatever the supported metadata is for the destination FS, so
-//        APFS→APFS round-trips are lossless.)
+//
+//	-a   archive: recursive + symlinks + perms + times + group/owner + devices
+//	-H   preserve hard links
+//	-E   preserve extended attributes (Apple-patched rsync 2.6.9 — this is the
+//	     flag that, on macOS, copies xattrs *and* ACLs *and* resource forks,
+//	     rolled into one. Without -E, the restored files lose the
+//	     com.apple.quarantine xattr (so Gatekeeper would re-prompt for any
+//	     downloaded .dmg/.pkg in the snapshot), Finder tags, custom icons,
+//	     and any access-control entries set with `chmod +a`. Apple maps -E
+//	     to whatever the supported metadata is for the destination FS, so
+//	     APFS→APFS round-trips are lossless.)
 func rsyncRestore(ctx context.Context, src, dst string) (string, error) {
 	srcDir := strings.TrimRight(src, "/") + "/"
 	dstDir := strings.TrimRight(dst, "/") + "/"
@@ -483,4 +539,3 @@ func RestoreFromBaseline(ctx context.Context, managedRoot string, restorePaths [
 
 	return nil
 }
-

@@ -15,7 +15,7 @@ A reboot-to-restore system for Intel Mac lab environments. On every boot, Niveni
 
 ## How it works
 
-1. **Setup** cleans up user session data, then captures an APFS snapshot of the Data volume via `diskutil apfs snapshot`. Each freeze writes a uniquely-timestamped snapshot name (e.g. `nivenia-20260426T143022Z`); the previous baseline is only deleted *after* the new one is confirmed, so a freeze that fails mid-flight never leaves the machine without a restore point.
+1. **Setup** cleans up user session data, then captures an APFS snapshot of the Data volume. Nivenia uses `diskutil apfs snapshot` when that verb is available and falls back to `tmutil localsnapshot` on macOS builds that do not expose it. Each freeze writes the new snapshot name to state before deleting the previous baseline, so a failure mid-flight never leaves the machine without a restore point.
 2. **On every boot**, a LaunchDaemon mounts that snapshot read-only (`mount_apfs -o nobrowse`) and rsyncs the configured restore paths back to the live volume — deleting anything not in the snapshot. Extended attributes (Gatekeeper quarantine flag, Finder tags, ACLs) are preserved via `rsync -E`.
 3. The snapshot is the baseline until the next freeze. Changes only affect the live volume and are reversed at the next reboot.
 4. **If three consecutive boot restores fail**, Nivenia auto-thaws and stops trying. The admin sees the trail in `niveniactl status` and `/var/log/nivenia.log`, and runs `niveniactl freeze` to recover. This prevents an infinite-failure loop after the snapshot has been deleted by, e.g., a macOS update.

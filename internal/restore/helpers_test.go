@@ -1,6 +1,7 @@
 package restore
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -117,6 +118,24 @@ func TestListAPFSSnapshotNames_Empty(t *testing.T) {
 	}
 	if len(names) != 0 {
 		t.Errorf("got %v, want empty", names)
+	}
+}
+
+// ── snapshot fallback helpers ───────────────────────────────────────────────
+
+func TestDiffSnapshotNames_FindsNewEntries(t *testing.T) {
+	before := []string{"snap-a", "snap-b"}
+	after := []string{"snap-a", "snap-b", "snap-c"}
+	created := diffSnapshotNames(before, after)
+	if len(created) != 1 || created[0] != "snap-c" {
+		t.Fatalf("diffSnapshotNames() = %v, want [snap-c]", created)
+	}
+}
+
+func TestUnsupportedAPFSSnapshotVerb_RecognizesDiskutilError(t *testing.T) {
+	err := fmt.Errorf(`diskutil apfs snapshot /System/Volumes/Data -name nivenia: exit status 1: diskutil: did not recognize APFS verb "snapshot"; type "diskutil apfs" for a list`)
+	if !isUnsupportedAPFSSnapshotVerb(err) {
+		t.Fatal("expected unsupported APFS snapshot verb to be recognized")
 	}
 }
 
