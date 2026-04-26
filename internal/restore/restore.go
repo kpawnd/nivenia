@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -462,6 +463,24 @@ func rsyncRestore(ctx context.Context, src, dst string) (string, error) {
 	return summary, lastErr
 }
 
+func restoreApplicationsFallback(ctx context.Context, src, dst string) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := os.RemoveAll(dst); err != nil {
+		return fmt.Errorf("remove %s before fallback restore: %w", dst, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return fmt.Errorf("recreate parent for %s: %w", dst, err)
+	}
+	cmd := exec.CommandContext(ctx, "ditto", src, dst)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("ditto %s -> %s: %w: %s", src, dst, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 func isRetryableRsyncError(err error) bool {
 	if err == nil {
 		return false
@@ -551,6 +570,15 @@ func RestoreFromBaseline(ctx context.Context, managedRoot string, restorePaths [
 		fmt.Fprintf(os.Stderr, "[restore] syncing %s...\n", targetPath)
 		stats, err := rsyncRestore(ctx, srcPath, targetPath)
 		if err != nil {
+			if pathpkg.Clean(targetPath) == "/System/Volumes/Data/Applications" && isRetryableRsyncError(err) {
+				fmt.Fprintf(os.Stderr, "[restore] rsync failed for %s; retrying with ditto fallback\n", targetPath)
+				if fallbackErr := restoreApplicationsFallback(ctx, srcPath, targetPath); fallbackErr == nil {
+					fmt.Fprintf(os.Stderr, "[restore] fallback restore for %s completed\n", targetPath)
+					continue
+				} else {
+					return fallbackErr
+				}
+			}
 			return err
 		}
 		elapsed := time.Since(t0).Round(time.Millisecond)
