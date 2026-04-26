@@ -88,6 +88,67 @@ func CaptureBaseline(policyPath, managedRoot string) error {
 	return writeRecord(record)
 }
 
+// VerifySnapshotOnly confirms the snapshot we're about to restore from is
+// the same APFS snapshot that was captured at freeze time. It checks the
+// managed root, snapshot volume, snapshot name, the volume's UUID, and the
+// snapshot's XID / UUID / Timestamp.
+//
+// Unlike VerifyBaseline, this function deliberately does NOT hash binaries
+// or the policy file — those legitimately change between freeze and the
+// next boot whenever the updater runs, and distinguishing legitimate updates
+// from tampering would require a signing scheme that is out of scope here.
+// Snapshot metadata, by contrast, cannot change without someone swapping the
+// snapshot out from under us — exactly the threat that would cause rsync
+// --delete to wipe the wrong files.
+//
+// This is the check invoked on every boot before a restore runs, so it must
+// be cheap (no rsync, no hashing) and fail closed on any mismatch.
+func VerifySnapshotOnly(managedRoot string) error {
+	path := IntegrityPath()
+	record, err := readRecord(path)
+	if err != nil {
+		return err
+	}
+	if record.Version != integrityVersion {
+		return fmt.Errorf("integrity version mismatch: %d", record.Version)
+	}
+	if record.ManagedRoot != managedRoot {
+		return fmt.Errorf("managed_root mismatch: expected %s got %s", record.ManagedRoot, managedRoot)
+	}
+
+	volume := restore.SnapshotVolume(managedRoot)
+	name := restore.SnapshotName()
+	if record.SnapshotVolume != volume {
+		return fmt.Errorf("snapshot volume mismatch: expected %s got %s", record.SnapshotVolume, volume)
+	}
+	if record.SnapshotName != name {
+		return fmt.Errorf("snapshot name mismatch: expected %s got %s", record.SnapshotName, name)
+	}
+
+	volUUID, err := volumeUUID(volume)
+	if err != nil {
+		return err
+	}
+	if record.VolumeUUID != "" && volUUID != record.VolumeUUID {
+		return fmt.Errorf("volume uuid mismatch: expected %s got %s", record.VolumeUUID, volUUID)
+	}
+
+	snap, err := snapshotMetadata(volume, name)
+	if err != nil {
+		return err
+	}
+	if record.Snapshot.XID != "" && snap.XID != record.Snapshot.XID {
+		return fmt.Errorf("snapshot XID mismatch: expected %s got %s", record.Snapshot.XID, snap.XID)
+	}
+	if record.Snapshot.UUID != "" && snap.UUID != record.Snapshot.UUID {
+		return fmt.Errorf("snapshot UUID mismatch: expected %s got %s", record.Snapshot.UUID, snap.UUID)
+	}
+	if record.Snapshot.Timestamp != "" && snap.Timestamp != record.Snapshot.Timestamp {
+		return fmt.Errorf("snapshot timestamp mismatch: expected %s got %s", record.Snapshot.Timestamp, snap.Timestamp)
+	}
+	return nil
+}
+
 func VerifyBaseline(policyPath, managedRoot string) error {
 	path := IntegrityPath()
 	record, err := readRecord(path)

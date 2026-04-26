@@ -14,6 +14,10 @@ import (
 	"nivenia/internal/state"
 )
 
+// version is stamped at build time via -ldflags "-X main.version=...".
+// The default "dev" is what a plain `go build` produces.
+var version = "dev"
+
 const (
 	ansiReset  = "\033[0m"
 	ansiBold   = "\033[1m"
@@ -102,11 +106,21 @@ Options:
 func main() {
 	statePath := flag.String("state", "/var/lib/nivenia/state.json", "state file path")
 	policyPath := flag.String("policy", "/etc/nivenia/policy.json", "policy file path")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
+	// --version is the smoke test the updater runs on a freshly-staged
+	// binary before it replaces the live one. It proves the executable is
+	// linkable and the right architecture for this OS. We keep the platform
+	// check in place so a new binary that doesn't support the running macOS
+	// version fails the smoke test instead of being installed.
 	if err := platform.EnsureSupportedMacOS(); err != nil {
 		fmt.Fprintf(os.Stderr, "niveniactl: %v\n", err)
 		os.Exit(1)
+	}
+	if *showVersion {
+		fmt.Println(version)
+		return
 	}
 
 	if flag.NArg() < 1 {

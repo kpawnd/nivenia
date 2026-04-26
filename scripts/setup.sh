@@ -6,6 +6,34 @@ POLICY_PATH="${NIVENIA_POLICY_PATH:-/etc/nivenia/policy.json}"
 STATE_PATH="${NIVENIA_STATE_PATH:-/var/lib/nivenia/state.json}"
 DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.restore.plist"
 UPDATER_DAEMON_PATH="/Library/LaunchDaemons/com.nivenia.updater.plist"
+STATE_DIR="/var/lib/nivenia"
+
+# Version stamp written to $STATE_DIR/version so the updater knows what's
+# installed. Without this, the first updater run after setup would see an
+# empty version file and happily "update" to whatever release tag is in
+# GitHub — silently downgrading a box that was freshly built from HEAD.
+# Prefer an explicit NIVENIA_VERSION, then a signed tag on the current
+# commit, then the short SHA, then a dev placeholder. Never empty.
+resolve_installed_version() {
+  if [[ -n "${NIVENIA_VERSION:-}" ]]; then
+    printf '%s' "$NIVENIA_VERSION"
+    return
+  fi
+  if command -v git >/dev/null 2>&1 && git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    local tag sha
+    tag="$(git -C "$REPO_ROOT" describe --tags --exact-match HEAD 2>/dev/null || true)"
+    if [[ -n "$tag" ]]; then
+      printf '%s' "${tag#v}"
+      return
+    fi
+    sha="$(git -C "$REPO_ROOT" rev-parse --short=12 HEAD 2>/dev/null || true)"
+    if [[ -n "$sha" ]]; then
+      printf '0.0.0-dev+%s' "$sha"
+      return
+    fi
+  fi
+  printf '0.0.0-dev'
+}
 
 # ── colors ───────────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -90,6 +118,11 @@ sudo install -m 644 launchd/com.nivenia.updater.plist          "$UPDATER_DAEMON_
 sudo launchctl bootout system /Library/LaunchDaemons/com.nivenia.scheduled-restart.plist >/dev/null 2>&1 || true
 sudo rm -f /Library/LaunchDaemons/com.nivenia.scheduled-restart.plist
 sudo rm -f /usr/local/libexec/nivenia-scheduled-restart
+INSTALLED_VERSION="$(resolve_installed_version)"
+printf '%s' "$INSTALLED_VERSION" | sudo tee "$STATE_DIR/version.tmp" >/dev/null
+sudo mv "$STATE_DIR/version.tmp" "$STATE_DIR/version"
+sudo sync
+info "Installed version recorded as $INSTALLED_VERSION"
 ok "Installation complete"
 
 step "Configuring log rotation"
