@@ -36,6 +36,23 @@ func TestParseRsyncStats_Empty(t *testing.T) {
 	}
 }
 
+func TestIsRetryableRsyncError(t *testing.T) {
+	cases := []string{
+		"rsync: error: unexpected end of file",
+		"rsync: error: unexpected EOF",
+		"rsync: error: broken pipe",
+		"rsync: error: connection unexpectedly closed",
+	}
+	for _, msg := range cases {
+		if !isRetryableRsyncError(fmt.Errorf(msg)) {
+			t.Fatalf("isRetryableRsyncError(%q) = false, want true", msg)
+		}
+	}
+	if isRetryableRsyncError(fmt.Errorf("rsync: error: permission denied")) {
+		t.Fatal("permission denied should not be retryable")
+	}
+}
+
 // ── isAPFSInfo ────────────────────────────────────────────────────────────────
 
 func TestIsAPFSInfo_Positive(t *testing.T) {
