@@ -42,6 +42,7 @@ func TestIsRetryableRsyncError(t *testing.T) {
 		"rsync: error: unexpected EOF",
 		"rsync: error: broken pipe",
 		"rsync: error: connection unexpectedly closed",
+		"rsync: exit status 20",
 	}
 	for _, msg := range cases {
 		if !isRetryableRsyncError(fmt.Errorf(msg)) {

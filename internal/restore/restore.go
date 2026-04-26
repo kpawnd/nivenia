@@ -443,7 +443,8 @@ func rsyncRestore(ctx context.Context, src, dst string) (string, error) {
 		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			switch exitErr.ExitCode() {
-			case 23, 24:
+			case 20, 23, 24:
+				// 20 = transfer interrupted by signal
 				// 23 = partial transfer (e.g. cross-directory hard links in system metadata)
 				// 24 = source files vanished mid-transfer
 				return summary, nil
@@ -469,7 +470,8 @@ func isRetryableRsyncError(err error) bool {
 	return strings.Contains(text, "unexpected end of file") ||
 		strings.Contains(text, "unexpected eof") ||
 		strings.Contains(text, "broken pipe") ||
-		strings.Contains(text, "connection unexpectedly closed")
+		strings.Contains(text, "connection unexpectedly closed") ||
+		strings.Contains(text, "exit status 20")
 }
 
 func parseRsyncStats(out string) string {
