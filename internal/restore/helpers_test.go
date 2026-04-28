@@ -124,35 +124,75 @@ func TestSnapshotDateRegex_RejectsUnrelatedOutput(t *testing.T) {
 	}
 }
 
-// ── hasRsyncErrors ────────────────────────────────────────────────────────────
+// ── classifyRsyncErrors ───────────────────────────────────────────────────────
 // openrsync writes errors to stderr in the form
-// "rsync(PID): error: <details>" or "rsync: error: <details>".
-// hasRsyncErrors must recognise both because openrsync exits 0 even
-// when these lines appear (the partial-transfer bug we're working
-// around). Recognising the pattern is what turns "exit 0 with errors"
-// into "real failure" in our decision logic.
+//   "rsync(PID): error: <details>"
+// or
+//   "rsync: error: <details>".
+//
+// Some of those lines come from a known race against macOS daemons
+// (photolibraryd, akd, mds, ...) recreating cache directories during
+// rsync's --delete phase — those are tolerable. Every other error
+// line is fatal. classifyRsyncErrors splits them so the caller can
+// decide whether to flip the boot into a failure.
 
-func TestHasRsyncErrors_DetectsOpenrsyncFormat(t *testing.T) {
-	cases := []string{
-		"rsync(11858): error: Thorium.app/Contents/MacOS/._Thorium: openat: No such file or directory",
-		"rsync: error: some generic failure",
-		"some prelude\nrsync(123): error: bad\ntrailing",
+// Captured verbatim from a production /var/log/nivenia logs run:
+// rsync exit=23 with these five stderr lines and nothing else.
+const productionDelRaceStderr = `rsync(368): error: admin/Library/Containers/com.apple.photolibraryd/Data/tmp: unlinkat: Directory not empty
+rsync(368): error: admin/Library/Containers/com.apple.photolibraryd/Data: unlinkat: Directory not empty
+rsync(368): error: admin/Library/Containers/com.apple.photolibraryd: unlinkat: Directory not empty
+rsync(368): error: admin/Library/Caches/com.apple.akd: unlinkat: Directory not empty
+rsync(368): error: ./admin/Library/Caches/com.apple.akd: unlinkat: Directory not empty
+`
+
+func TestClassifyRsyncErrors_AllDaemonRace(t *testing.T) {
+	race, fatal := classifyRsyncErrors(productionDelRaceStderr)
+	if len(race) != 5 {
+		t.Errorf("expected 5 race lines, got %d: %v", len(race), race)
 	}
-	for _, c := range cases {
-		if !hasRsyncErrors(c) {
-			t.Errorf("hasRsyncErrors(%q) = false, want true", c)
-		}
+	if len(fatal) != 0 {
+		t.Errorf("expected 0 fatal lines, got %v", fatal)
 	}
 }
 
-func TestHasRsyncErrors_IgnoresStatsAndWarnings(t *testing.T) {
-	clean := strings.Join([]string{
+func TestClassifyRsyncErrors_FatalAlongsideRace(t *testing.T) {
+	in := productionDelRaceStderr +
+		"rsync: error: failed to read source file: permission denied\n"
+	race, fatal := classifyRsyncErrors(in)
+	if len(race) != 5 {
+		t.Errorf("race lines: got %d, want 5", len(race))
+	}
+	if len(fatal) != 1 || !strings.Contains(fatal[0], "permission denied") {
+		t.Errorf("fatal lines: got %v, want one permission-denied line", fatal)
+	}
+}
+
+// AppleDouble openat ENOENT is the bug the previous commit's -E
+// flag triggered. With -E removed those lines should never appear,
+// but if they DO they are NOT a daemon race and must be classified
+// as fatal so we don't silently ship a half-restore.
+func TestClassifyRsyncErrors_AppleDoubleIsNotRace(t *testing.T) {
+	in := "rsync(11858): error: Thorium.app/Contents/MacOS/._Thorium: openat: No such file or directory\n"
+	race, fatal := classifyRsyncErrors(in)
+	if len(race) != 0 {
+		t.Errorf("race lines: got %v, want 0", race)
+	}
+	if len(fatal) != 1 {
+		t.Errorf("fatal lines: got %d, want 1", len(fatal))
+	}
+}
+
+func TestClassifyRsyncErrors_IgnoresNonErrorLines(t *testing.T) {
+	in := strings.Join([]string{
 		"Number of files: 1234",
 		"sent 100 bytes  received 50 bytes",
 		"warning: not an error",
+		"",
+		"some informational line",
 	}, "\n")
-	if hasRsyncErrors(clean) {
-		t.Errorf("hasRsyncErrors(clean stats) = true, want false")
+	race, fatal := classifyRsyncErrors(in)
+	if len(race) != 0 || len(fatal) != 0 {
+		t.Errorf("clean stderr should produce zero buckets, got race=%v fatal=%v", race, fatal)
 	}
 }
 

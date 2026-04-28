@@ -7,3 +7,4 @@ bin/
 /niveniad.exe
 /niveniactl.exe
 dist/
+*.darwin

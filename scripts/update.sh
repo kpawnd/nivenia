@@ -145,8 +145,34 @@ resolve_version() {
     printf '%s' "$CHANNEL"
     return
   fi
+  # Fetch the latest release. If the repo has never published one,
+  # GitHub's API returns 404 and curl -f exits 22; we want to log
+  # ONE clean line in that case rather than letting raw curl errors
+  # spill into nivenia-updater.log on every scheduled run. Any other
+  # curl failure (network, DNS, 5xx) is also folded into "could not
+  # resolve" with the HTTP status preserved for triage.
   local api_url="https://api.github.com/repos/${REPO}/releases/latest"
-  curl -fsSL "$api_url" | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' | head -n1
+  local body http rc
+  body="$(mktemp)"
+  http="$(curl -sS -o "$body" -w '%{http_code}' --max-time 30 "$api_url" 2>/dev/null || true)"
+  rc=$?
+  if [[ -z "$http" ]]; then
+    rm -f "$body"
+    log "no_release: curl could not reach GitHub (rc=$rc, repo=$REPO)"
+    return
+  fi
+  if [[ "$http" == "404" ]]; then
+    rm -f "$body"
+    log "no_release: $REPO has no published release yet (HTTP 404); skipping"
+    return
+  fi
+  if [[ "$http" != "200" ]]; then
+    rm -f "$body"
+    log "no_release: GitHub API returned HTTP $http for $REPO; skipping"
+    return
+  fi
+  sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p' "$body" | head -n1
+  rm -f "$body"
 }
 
 current_version() {
@@ -174,8 +200,11 @@ fi
 
 VERSION="$(resolve_version)"
 if [[ -z "$VERSION" ]]; then
-  log "could not resolve target version"
-  exit 1
+  # resolve_version already logged the specific reason (no release
+  # yet, network failure, or non-200 status). An empty version means
+  # there's nothing to install, not a failure of the updater itself,
+  # so exit 0 to keep launchd's view of the job healthy.
+  exit 0
 fi
 
 CURRENT="$(current_version)"

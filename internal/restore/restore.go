@@ -493,18 +493,69 @@ func mountSnapshotAt(log *nivlog.Logger, device, snapshotName, mountPoint string
 //
 //	rsync(12345): error: <details>
 //	rsync: error: <details>
-//	rsync: <details>: ENOENT (...) (only when accompanied by other error markers)
 //
-// We deliberately keep this strict — a literal "error:" token in the
-// output is openrsync's documented signal of a real failure.
-var rsyncErrorLineRE = regexp.MustCompile(`(?m)^rsync(?:\([0-9]+\))?:\s*error:`)
+// A literal "error:" token in the output is openrsync's documented
+// signal of a real failure (or, for the daemon-race case below, a
+// recoverable cleanup failure — we classify lines further once we
+// know they're errors).
+var rsyncErrorLineRE = regexp.MustCompile(`^rsync(?:\([0-9]+\))?:\s*error:`)
 
-// hasRsyncErrors scans rsync stderr for openrsync's "error:" markers.
-// This is the only reliable failure signal under openrsync's exit-0-
-// with-errors bug; we use it in addition to the exit code, never
-// instead of it.
-func hasRsyncErrors(stderr string) bool {
-	return rsyncErrorLineRE.MatchString(stderr)
+// rsyncRaceErrorRE matches stderr error lines from openrsync's
+// `--delete` cleanup phase that lost a race against a macOS daemon
+// (photolibraryd, akd, mds, ...) recreating files in a directory
+// rsync was trying to remove. Observed on every Sequoia run that
+// has a logged-in user, captured verbatim from production logs:
+//
+//	rsync(368): error: admin/Library/Containers/com.apple.photolibraryd/Data/tmp: unlinkat: Directory not empty
+//	rsync(368): error: admin/Library/Caches/com.apple.akd: unlinkat: Directory not empty
+//
+// These directories live OUTSIDE the snapshot (the daemon created
+// them post-freeze) and contain only daemon-managed cache files
+// that are rebuilt on demand. The transfer phase still completed
+// — every file from the snapshot is on the live volume. The only
+// thing the race left behind is a daemon's freshly-rewritten cache
+// directory that we couldn't unlink in time.
+//
+// For boot-restore semantics — "the live volume should look like
+// the snapshot for everything we care about" — this is acceptable:
+// the file content from the snapshot is fully in place; some
+// daemon-managed sibling directories survive. We surface it as a
+// WARN-level structured event ("rsync.partial.delete_race") so an
+// admin can still see the names of the directories that lost the
+// race, but we don't flip the boot into a failure mode.
+//
+// Anchor on the message tail because openrsync prefixes the error
+// with the relative path; we don't want to be tied to any specific
+// daemon name.
+var rsyncRaceErrorRE = regexp.MustCompile(`unlinkat:\s*Directory not empty\s*$`)
+
+// classifyRsyncErrors splits stderr lines that match the rsync
+// "error:" prefix into two buckets:
+//
+//   - race: lines whose tail is "unlinkat: Directory not empty",
+//     i.e. the daemon-rebuild cleanup race documented above.
+//     Tolerable.
+//   - fatal: every other rsync error line. Intolerable; even one
+//     of these means the restore did not complete cleanly and the
+//     caller must fail the boot.
+//
+// Non-error lines (stats, warnings, blank) are ignored.
+func classifyRsyncErrors(stderr string) (race []string, fatal []string) {
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !rsyncErrorLineRE.MatchString(line) {
+			continue
+		}
+		if rsyncRaceErrorRE.MatchString(line) {
+			race = append(race, line)
+		} else {
+			fatal = append(fatal, line)
+		}
+	}
+	return
 }
 
 // rsyncResult is the parsed outcome of one rsync invocation. We carry
@@ -621,7 +672,11 @@ func rsyncRestore(ctx context.Context, log *nivlog.Logger, src, dst string) (str
 		detailPath = log.WriteDetail("rsync-"+filepath.Base(dstDir), body)
 	}
 
-	if res.exitCode == 0 && !hasRsyncErrors(res.stderr) {
+	race, fatal := classifyRsyncErrors(res.stderr)
+
+	// Clean success: rsync exited 0 and stderr is silent (or only
+	// contained warnings we don't recognise, which we still ignore).
+	if res.exitCode == 0 && len(race) == 0 && len(fatal) == 0 {
 		if log != nil {
 			log.Info("rsync.ok",
 				"src", srcDir,
@@ -633,17 +688,46 @@ func rsyncRestore(ctx context.Context, log *nivlog.Logger, src, dst string) (str
 		return res.statsLine, nil
 	}
 
-	// Failure path. Build an error message that's both grep-friendly
-	// in the main log AND points to the detail file for the full
-	// transcript. We deliberately do NOT silently treat any non-zero
-	// exit as success — that hid the openrsync corruption that was
-	// shipping half-restores.
-	stderrSnippet := firstNonEmptyLines(res.stderr, 5)
+	// Tolerated partial: the transfer succeeded but `--delete`
+	// cleanup lost a race against a still-running macOS daemon.
+	// rsync exits 0 (when the race produces no openrsync errors)
+	// or 23 (when it does). We accept either, BUT only when every
+	// stderr error line is the daemon-race pattern. A single fatal
+	// error in the same batch tips the whole run into failure —
+	// we don't silently mix partial cleanup with real corruption.
+	if (res.exitCode == 0 || res.exitCode == 23) && len(fatal) == 0 && len(race) > 0 {
+		if log != nil {
+			log.Warn("rsync.partial.delete_race",
+				"src", srcDir,
+				"dst", dstDir,
+				"exit", res.exitCode,
+				"skipped_dirs", len(race),
+				"sample", firstNonEmptyLines(strings.Join(race, "\n"), 3),
+				"stats", res.statsLine,
+				"detail", detailPath,
+			)
+		}
+		return res.statsLine, nil
+	}
+
+	// Genuine failure. Build an error message that's both grep-
+	// friendly in the main log AND points to the detail file for
+	// the full transcript. We deliberately do NOT treat any
+	// non-zero exit as success blindly — that hid the openrsync
+	// half-restore bug we already paid for.
+	combined := append([]string{}, fatal...)
+	combined = append(combined, race...)
+	if len(combined) == 0 {
+		combined = []string{strings.TrimSpace(res.stderr)}
+	}
+	stderrSnippet := firstNonEmptyLines(strings.Join(combined, "\n"), 5)
 	if log != nil {
 		log.Error("rsync.fail",
 			"src", srcDir,
 			"dst", dstDir,
 			"exit", res.exitCode,
+			"fatal_count", len(fatal),
+			"race_count", len(race),
 			"stderr_summary", stderrSnippet,
 			"detail", detailPath,
 		)
